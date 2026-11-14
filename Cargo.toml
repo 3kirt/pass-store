@@ -1,0 +1,49 @@
+[package]
+name = "pass-store"
+version = "0.1.0"
+edition = "2024"
+# The lowest of the apps that depend on this crate (proxmox-mcp).
+rust-version = "1.88"
+description = "A pass-compatible, never-prompting GPG token store for MCP servers"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/3kirt/pass-store"
+readme = "README.md"
+keywords = ["pass", "gpg", "gnupg", "password-store", "mcp"]
+categories = ["authentication", "cryptography"]
+include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[features]
+# The shared fake gpg for the apps' own tests (client, launch_path).
+test-support = ["dep:tempfile"]
+# A lazily decrypted, rotation-aware HTTP auth header (`LazyToken`).
+http = ["dep:http", "tokio/sync"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Unfixable: the transitive dependency tree can carry duplicate crate
+# versions (e.g. windows-sys via tokio and tempfile).
+multiple_crate_versions = "allow"
+# Doc comments are prose-heavy and reference many proper nouns and API terms
+# (GnuPG, gpg-agent, Assuan, KEYINFO, …); backticking them all is noise.
+doc_markdown = "allow"
+# `test-support` is the conventional name for a feature that exports test
+# helpers, and the apps' dev-dependencies name it.
+redundant_feature_names = "allow"
+
+[dependencies]
+percent-encoding = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "time"] }
+tracing = "0.1"
+http = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+
+[package.metadata.docs.rs]
+all-features = true

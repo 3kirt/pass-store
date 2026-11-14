@@ -1,0 +1,74 @@
+name: Release
+
+# Publishes the crate to crates.io from a version tag on main, then creates
+# the GitHub release with the published .crate, its provenance attestation,
+# and notes from CHANGELOG.md. Needs a CARGO_REGISTRY_TOKEN repository secret
+# (a crates.io API token scoped to publish-update for pass-store).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Tag matches Cargo.toml version
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} != Cargo.toml version ${version}"; exit 1
+          fi
+      - name: Tag commit is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: CHANGELOG has a section for this version
+        run: scripts/changelog-section.sh "${GITHUB_REF_NAME#v}" > /dev/null
+
+  checks:
+    name: Checks
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to crates.io
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+      - name: Checksums
+        run: cd target/package && sha256sum pass-store-*.crate > checksums.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/package/pass-store-*.crate
+      - name: Release notes from CHANGELOG
+        run: scripts/changelog-section.sh "${GITHUB_REF_NAME#v}" > release-notes.md
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          files: |
+            target/package/pass-store-*.crate
+            target/package/checksums.txt
+          body_path: release-notes.md
+          fail_on_unmatched_files: true

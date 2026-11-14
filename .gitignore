@@ -1,0 +1,4 @@
+/target
+
+# Local-only Claude Code config
+.claude/settings.local.json
