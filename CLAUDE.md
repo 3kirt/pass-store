@@ -65,6 +65,11 @@ GPL-3.0-compatible before it goes into `deny.toml`. The crate is
 GPL-3.0-or-later, which fits proxmox and gitlab (GPL-3.0-only) and netbox
 (GPL-3.0-or-later). CHANGELOG headings are `## [X.Y.Z] - YYYY-MM-DD`.
 
+**Public API:** keep it small. Everything public is re-exported at the crate
+root, except the `agent` module (Unix-only) and `test_support` (feature
+`test-support`). Helpers the apps don't call stay private. Fallible public
+functions return `PassError` (or `TokenError`), never `String`.
+
 Clippy runs at **pedantic** strictness: the `pedantic`, `nursery`, and `cargo`
 lint groups are enabled in `Cargo.toml` under `[lints.clippy]`, with a curated,
 commented allow-list (`multiple_crate_versions`, `doc_markdown`,
@@ -123,8 +128,8 @@ Every invariant below has a unit test; a fix comes with a regression test.
 src/
   lib.rs          — re-exports; agent_status() (one status line, any platform)
   store.rs        — Branding, PassStore, PassEntry, PassError, StoreLocation, StoreEnv, read/write/recipients, helpers
-  env.rs          — env_var / non_blank / is_unset_value / is_unexpanded_placeholder / home_dir / expand_tilde(_in)
-  agent.rs        — (unix) gpg-agent Assuan KEYINFO client, used only by `status`
+  env.rs          — (private, re-exported at the root) env_var / non_blank / is_unset_value / is_unexpanded_placeholder / home_dir / expand_tilde(_in)
+  agent.rs        — (unix) gpg-agent Assuan KEYINFO client, used only by `status`; public: state(), AgentState
   token.rs        — (feature http) LazyToken
   test_support.rs — (test or feature test-support) fake gpg and gpgconf, snippets, EnvGuard, lock_env
   real_gpg.rs     — (unix, #[ignore], REAL_GPG=1) the real-gpg classification test

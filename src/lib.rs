@@ -15,6 +15,18 @@
 //! The app names itself once, with a [`Branding`], so every message gives
 //! advice for that app (`proxmox-mcp --config-dir '/x' unlock`).
 //!
+//! [`PassStore::resolve`] reads nothing from the process environment: the
+//! app passes a [`StoreEnv`], in production [`StoreEnv::from_process`].
+//!
+//! The env helpers ([`env_var`], [`non_blank`], [`is_unset_value`],
+//! [`is_unexpanded_placeholder`]) are the one "is this value set?" rule for
+//! env vars and config values, shared with the apps' own config loading:
+//! blank counts as unset, and so does an unexpanded `${VAR}` placeholder.
+//! MCP clients substitute `${GITLAB_TOKEN}`-style placeholders from the
+//! user's environment, and when the variable isn't exported Claude Code
+//! passes the placeholder through *literally*. Taking that as a real token
+//! would shadow a `pass_entry` and fail every call with a 401.
+//!
 //! Cargo features:
 //! - `http`: [`LazyToken`], a pass-backed HTTP auth header that is decrypted
 //!   on first use and re-read when the server rejects it.
@@ -23,7 +35,7 @@
 
 #[cfg(unix)]
 pub mod agent;
-pub mod env;
+mod env;
 #[cfg(all(test, unix))]
 mod real_gpg;
 mod store;

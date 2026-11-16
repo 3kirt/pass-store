@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::PassStore;
+use crate::{PassError, PassStore};
 
 const AGENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -25,13 +25,13 @@ const GPG_ERR_NOT_FOUND: u32 = 27;
 
 /// The `KEYINFO` fields this crate cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyInfo {
+struct KeyInfo {
     /// `D` = key stored on disk, `T` = smartcard, `X` = unknown.
-    pub kind: char,
+    kind: char,
     /// Passphrase currently in gpg-agent's cache.
-    pub cached: bool,
+    cached: bool,
     /// `P` = passphrase-protected, `C` = not protected, `-` = unknown.
-    pub protection: char,
+    protection: char,
 }
 
 /// Summary of whether the token's key can decrypt without a prompt.
@@ -65,27 +65,33 @@ impl AgentState {
 }
 
 /// The agent's state for the keys that can decrypt for `recipients`: the
-/// whole keygrip → socket → `KEYINFO` → [`summarize`] sequence a `status`
-/// command runs.
+/// whole check a `status` command runs.
+///
+/// It lists the recipients' encryption keygrips with gpg, finds the agent's
+/// socket with gpgconf, asks the agent about each keygrip (`KEYINFO`), and
+/// reduces the answers to one state. For a ready status line, see
+/// [`crate::agent_status`].
 ///
 /// # Errors
 ///
-/// When gpg, gpgconf or the agent fails or times out.
-pub async fn state(store: &PassStore, recipients: &[String]) -> Result<AgentState, String> {
-    let grips = encryption_keygrips(store, recipients).await?;
-    if grips.is_empty() {
-        return Ok(AgentState::NoSecretKey);
-    }
-    let socket = agent_socket(store).await?;
-    Ok(query_socket(&socket, &grips)
-        .await?
-        .map_or(AgentState::NotRunning, |infos| summarize(&infos)))
+/// [`PassError::Other`] when gpg, gpgconf or the agent fails or times out.
+pub async fn state(store: &PassStore, recipients: &[String]) -> Result<AgentState, PassError> {
+    let run = async {
+        let grips = encryption_keygrips(store, recipients).await?;
+        if grips.is_empty() {
+            return Ok(AgentState::NoSecretKey);
+        }
+        let socket = agent_socket(store).await?;
+        Ok(query_socket(&socket, &grips)
+            .await?
+            .map_or(AgentState::NotRunning, |infos| summarize(&infos)))
+    };
+    run.await.map_err(PassError::Other)
 }
 
 /// Reduce per-keygrip results (`None` = agent doesn't hold that key) to one
 /// state. Any usable key wins, since gpg tries every recipient.
-#[must_use]
-pub fn summarize(infos: &[Option<KeyInfo>]) -> AgentState {
+fn summarize(infos: &[Option<KeyInfo>]) -> AgentState {
     let held: Vec<&KeyInfo> = infos.iter().flatten().collect();
     if held.iter().any(|k| k.cached) {
         AgentState::Unlocked
@@ -107,7 +113,7 @@ pub fn summarize(infos: &[Option<KeyInfo>]) -> AgentState {
 /// # Errors
 ///
 /// When gpg can't be run or times out.
-pub async fn encryption_keygrips(
+async fn encryption_keygrips(
     store: &PassStore,
     recipients: &[String],
 ) -> Result<Vec<String>, String> {
@@ -167,7 +173,7 @@ fn parse_encryption_keygrips(colons: &str) -> Vec<String> {
 /// # Errors
 ///
 /// When gpgconf can't be run, fails or times out.
-pub async fn agent_socket(store: &PassStore) -> Result<PathBuf, String> {
+async fn agent_socket(store: &PassStore) -> Result<PathBuf, String> {
     let mut cmd = store.gpgconf_command();
     cmd.args(["--list-dirs", "agent-socket"]);
     let output = run(cmd, "gpgconf", "running gpgconf").await?;
@@ -206,7 +212,7 @@ fn percent_unescape(s: &str) -> String {
 ///
 /// On any other connection error, a protocol error, an unexpected `ERR`
 /// reply, an invalid keygrip, or a timeout.
-pub async fn query_socket(
+async fn query_socket(
     socket: &Path,
     grips: &[String],
 ) -> Result<Option<Vec<Option<KeyInfo>>>, String> {

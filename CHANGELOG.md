@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolving never races with a test that changes the environment. In
   production, pass `&StoreEnv::from_process()` (a snapshot with today's
   blank and `${VAR}` rules); in tests, build a `StoreEnv` directly.
+- **Breaking:** `agent::state` returns `Result<AgentState, PassError>`
+  (errors are `PassError::Other`) instead of `Result<_, String>`.
+- **Breaking:** the low-level agent functions are private:
+  `encryption_keygrips`, `agent_socket`, `query_socket`, `summarize` and
+  `KeyInfo`. The public agent API is `agent::state`, `AgentState`
+  (`describe`) and `agent_status`.
+- **Breaking:** the `env` module is private; its helpers are reachable only
+  at the crate root (`pass_store::env_var`, not `pass_store::env::env_var`).
 
 ### Added
 - `StoreEnv` and `StoreEnv::from_process`.
