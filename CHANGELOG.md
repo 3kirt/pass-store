@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- `test_support::lock_env`, `EnvGuard` and the README ("Testing an app that
+  uses it") say that an app must use pass-store's `lock_env()` as its only
+  environment lock. A separate app lock doesn't exclude pass-store's reads
+  of `HOME` / `PASSWORD_STORE_DIR` / `GNUPGHOME`. They also say how to hold
+  it in an async test.
+
 ## [0.1.0] - 2026-11-16
 
 The first release: the pass-compatible GPG token store that gitlab-mcp,

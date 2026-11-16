@@ -156,6 +156,18 @@ exit 2
 /// whole test body around any `set_var` (`HOME`, `PASSWORD_STORE_DIR`,
 /// `GNUPGHOME`, …), and around anything that resolves a store from the
 /// environment.
+///
+/// **Use this lock as your app's only environment lock.** A second lock of
+/// your own doesn't exclude this one: a test holding it can still change
+/// `HOME` while pass-store reads it (e.g. in [`crate::PassStore::resolve`]
+/// or [`crate::home_dir`]). Re-export it where your tests expect their lock,
+/// e.g. `pub use pass_store::test_support::lock_env;`. Also check for tests
+/// that reach config loading or `resolve()` without holding it at all.
+///
+/// The guard is a std mutex guard, so don't hold it across an `.await`
+/// (clippy's `await_holding_lock` rejects that). In a test that needs the
+/// lock around async code, use a sync `#[test]` that takes the lock and
+/// then `block_on`s its own tokio runtime.
 pub fn lock_env() -> MutexGuard<'static, ()> {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     ENV_LOCK
@@ -168,7 +180,8 @@ pub fn lock_env() -> MutexGuard<'static, ()> {
 ///
 /// It holds [`lock_env`] for its whole life, so tests that change the
 /// environment never overlap with each other or with tests that read it
-/// under the same lock.
+/// under the same lock. The same rules apply: it must be the app's only
+/// environment lock, and it can't be held across an `.await`.
 ///
 /// ```
 /// # use pass_store::test_support::EnvGuard;

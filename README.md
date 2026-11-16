@@ -81,7 +81,19 @@ pass-store = { path = "../pass-store" }
 | Feature        | What it adds |
 |----------------|--------------|
 | `http`         | `LazyToken`: an HTTP auth header decrypted on first use (one gpg run for concurrent callers). It is re-read when the server rejects it, so the first request after `login` rotates the token can retry once, and it backs off for 30s when that re-read fails. Depends only on `http = "1"`. |
-| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with a matching fake gpgconf for `status` tests, plus `EnvGuard` (and `lock_env()`) for tests that touch the environment. |
+| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with a matching fake gpgconf for `status` tests, plus `EnvGuard` (and `lock_env()`) for tests that touch the environment. Make `lock_env()` the app's only environment lock (see below). |
+
+### Testing an app that uses it
+
+pass-store reads `HOME`, `PASSWORD_STORE_DIR` and `GNUPGHOME`, so an app's
+tests that change the environment must exclude pass-store's reads too. A
+separate lock in the app doesn't: make `pass_store::test_support::lock_env()`
+the app's one environment lock (e.g. `pub use
+pass_store::test_support::lock_env;` where your tests expect it), or set
+variables through `EnvGuard`, which holds it. Hold it in any test that
+reaches config loading or `PassStore::resolve()`, even one that only reads.
+The guard can't be held across an `.await`: in an async test that needs it,
+use a sync `#[test]` that takes the lock and `block_on`s its own runtime.
 
 ## Development
 
