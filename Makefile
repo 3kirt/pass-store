@@ -46,9 +46,18 @@ test: test-scripts
 test-scripts:
 	scripts/test-changelog.sh
 
-# Classification against the real gpg (generates throwaway keys).
+# Classification against the real gpg (generates throwaway keys). Fails
+# unless the test actually ran: a filter matching nothing, or a skip, still
+# reports `ok`.
+REAL_GPG_TEST := real_gpg::real_gpg_status_codes_classify_as_expected
 test-real-gpg:
-	REAL_GPG=1 cargo test --locked --all-features real_gpg -- --ignored
+	@out=$$(REAL_GPG=1 cargo test --locked --all-features --lib -- --ignored --exact $(REAL_GPG_TEST) 2>&1); \
+	status=$$?; printf '%s\n' "$$out"; \
+	[ $$status -eq 0 ] || exit $$status; \
+	if printf '%s\n' "$$out" | grep -q skipping \
+		|| ! printf '%s\n' "$$out" | grep -q 'test result: ok. 1 passed'; then \
+		echo "test-real-gpg: the real-gpg test did not run" >&2; exit 1; \
+	fi
 
 lint: secrets-scan clippy fmt-check doc lint-workflows
 

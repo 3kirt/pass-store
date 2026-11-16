@@ -24,7 +24,7 @@ make minimal-versions # direct deps at Cargo.toml's lower bounds (nightly resolv
 make check-windows    # clippy for x86_64-pc-windows-msvc: the cfg(not(unix)) paths
 make coverage         # cargo llvm-cov incl. real gpg; fails under COVERAGE_MIN (97%) lines
 make package          # cargo package (PACKAGE_FLAGS=--allow-dirty before committing)
-make test-real-gpg    # REAL_GPG=1: classification against the real gpg (makes throwaway keys)
+make test-real-gpg    # REAL_GPG=1: the real-gpg test (throwaway keys); fails if it skipped or didn't run
 
 cargo test <test_name>   # run a single test
 ```
@@ -42,7 +42,10 @@ truth, and the workflows only call its targets.
   `cargo publish` (secret `CARGO_REGISTRY_TOKEN`), then a GitHub release with
   the `.crate`, a checksum, a provenance attestation and notes from
   `scripts/changelog-section.sh`. Release with `/release`
-  (`.claude/commands/release.md`).
+  (`.claude/commands/release.md`). It runs pre-flight checks (clean `main`,
+  the secret, a version not already on crates.io), the full local gate,
+  cargo-semver-checks from the second release on, and, after publishing, a
+  build of a throwaway crate against the published version.
 - `scheduled.yml` runs weekly: deny, msrv, stable/beta drift and real gpg on
   ubuntu and macos. A failure opens a `scheduled-failure` issue.
 - Actions are pinned by commit SHA, with a `# vX.Y.Z` comment.

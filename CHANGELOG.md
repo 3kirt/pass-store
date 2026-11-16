@@ -59,3 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - rustdoc with warnings as errors
   - actionlint and shellcheck
 - Tests run once per feature set.
+- `make test-real-gpg` fails when the real-gpg test skipped or matched
+  nothing, instead of reporting `ok`.
+- `/release` now follows gitlab-mcp's: pre-flight checks (clean `main`, the
+  `CARGO_REGISTRY_TOKEN` secret, the version not already published), every
+  local gate, cargo-semver-checks from the second release, and a post-publish
+  build of a throwaway crate against the published version.
