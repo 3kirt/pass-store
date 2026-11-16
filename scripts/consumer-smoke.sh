@@ -13,13 +13,18 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 url=${1:-file://$here}
 if [ $# -ge 2 ]; then
   ref="tag = \"$2\""
+  # The tag's own version: release.yml has the tag checked out.
+  manifest=$(cat "$here/Cargo.toml")
 else
   ref="rev = \"$(git -C "$here" rev-parse HEAD)\""
   if [ -n "$(git -C "$here" status --porcelain)" ]; then
     echo "consumer-smoke: note: testing HEAD; uncommitted changes are not included" >&2
   fi
+  # The version of the commit under test, not of the work tree (which may
+  # hold an uncommitted version bump).
+  manifest=$(git -C "$here" show HEAD:Cargo.toml)
 fi
-version=$(sed -n 's/^version *= *"\([0-9]*\.[0-9]*\)\..*"/\1/p' "$here/Cargo.toml" | head -1)
+version=$(printf '%s\n' "$manifest" | sed -n 's/^version *= *"\([0-9]*\.[0-9]*\)\..*"/\1/p' | head -1)
 toolchain=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$here/rust-toolchain.toml")
 
 tmp=$(mktemp -d)
