@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-16
+
 The first release: the pass-compatible GPG token store that gitlab-mcp,
 netbox-mcp and proxmox-mcp each carry a copy of, merged into one crate with
 every review fix from all three copies. It is distributed from GitHub only
