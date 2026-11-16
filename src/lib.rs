@@ -37,7 +37,9 @@ mod token;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-pub use env::{env_var, home_dir, is_unexpanded_placeholder, non_blank};
+pub use env::{
+    env_var, expand_tilde, home_dir, is_unexpanded_placeholder, is_unset_value, non_blank,
+};
 pub use store::{
     Branding, GPG_TIMEOUT, PassEntry, PassError, PassStore, StoreLocation, create_private_dir,
     create_private_file, shell_quote,

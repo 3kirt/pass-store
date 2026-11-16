@@ -14,7 +14,7 @@ categories = ["authentication", "cryptography"]
 publish = false
 
 [features]
-# The shared fake gpg for the apps' own tests (client, launch_path).
+# The shared fake gpg and gpgconf, and EnvGuard, for the apps' own tests.
 test-support = ["dep:tempfile"]
 # A lazily decrypted, rotation-aware HTTP auth header (`LazyToken`).
 http = ["dep:http", "tokio/sync"]

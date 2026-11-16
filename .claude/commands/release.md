@@ -46,9 +46,11 @@ pushed. A broken release is fixed by a new version.
 
 ### 3. Update Cargo.toml and Cargo.lock
 
-Change the `version` field in `Cargo.toml` to the new version string, then
-run `cargo build` (without `--locked`) so Cargo rewrites `Cargo.lock` to match.
-This is the only step that runs without `--locked`.
+Skip this step on the first release: Cargo.toml already says `0.1.0`.
+
+Otherwise change the `version` field in `Cargo.toml` to the new version
+string, then run `cargo build` (without `--locked`) so Cargo rewrites
+`Cargo.lock` to match. This is the only step that runs without `--locked`.
 
 ```
 cargo build
@@ -163,6 +165,9 @@ git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "Bump version to <new version>"
 make consumer-smoke
 ```
+
+On the first release only `CHANGELOG.md` changed: commit it as
+"Release 0.1.0".
 
 `make consumer-smoke` now builds against the bump commit itself, exactly as
 an app pinning it would fetch it.

@@ -37,6 +37,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: make msrv
 
+  minimal-versions:
+    name: Minimal versions
+    # Resolving needs nightly, whose `-Z direct-minimal-versions` can change
+    # without a code change here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install nightly --profile minimal
+      - name: Install the rust-version toolchain
+        run: rustup toolchain install "$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: make minimal-versions
+
   toolchain-drift:
     name: Toolchain drift (${{ matrix.toolchain }})
     strategy:
@@ -82,7 +95,7 @@ jobs:
 
   notify:
     name: Report failure
-    needs: [deny, msrv, toolchain-drift, real-gpg]
+    needs: [deny, msrv, minimal-versions, toolchain-drift, real-gpg]
     if: failure()
     runs-on: ubuntu-latest
     permissions:

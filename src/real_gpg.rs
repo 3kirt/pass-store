@@ -8,6 +8,9 @@
 //! The GnuPG home is a fresh temp dir with a short name: gpg-agent's socket
 //! lives inside it, and macOS limits socket paths to 104 bytes.
 
+//! Unix-only, like the agent client it also exercises.
+
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -39,11 +42,7 @@ impl Home {
             .prefix("psg")
             .tempdir()
             .expect("temp GnuPG home");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         Self(dir)
     }
 
@@ -156,15 +155,11 @@ async fn real_gpg_status_codes_classify_as_expected() {
         .write_token(TOKEN, &["locked@example.invalid".into()])
         .await
         .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(locked.path())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "real gpg's output mode: {mode:o}");
-    }
+    let mode = std::fs::metadata(locked.path())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "real gpg's output mode: {mode:o}");
     let foreign_entry = foreign_entry(&home, &store);
 
     // Generating with a loopback passphrase may have cached it: forget it.
@@ -187,25 +182,22 @@ async fn real_gpg_status_codes_classify_as_expected() {
     );
 
     // What a `status` command reports for each, from the agent itself.
-    #[cfg(unix)]
-    {
-        let state = |who: &'static str| {
-            let store = store.clone();
-            async move { agent::state(&store, &[who.to_string()]).await.unwrap() }
-        };
-        assert_eq!(
-            state("open@example.invalid").await,
-            agent::AgentState::Unprotected
-        );
-        assert_eq!(
-            state("locked@example.invalid").await,
-            agent::AgentState::Locked
-        );
-        assert_eq!(
-            state("foreign@example.invalid").await,
-            agent::AgentState::NoSecretKey
-        );
-    }
+    let state = |who: &'static str| {
+        let store = store.clone();
+        async move { agent::state(&store, &[who.to_string()]).await.unwrap() }
+    };
+    assert_eq!(
+        state("open@example.invalid").await,
+        agent::AgentState::Unprotected
+    );
+    assert_eq!(
+        state("locked@example.invalid").await,
+        agent::AgentState::Locked
+    );
+    assert_eq!(
+        state("foreign@example.invalid").await,
+        agent::AgentState::NoSecretKey
+    );
 
     // Prime the agent cache the way `unlock` would (loopback instead of a
     // pinentry); then the same non-interactive read succeeds. gpg writes
@@ -220,11 +212,8 @@ async fn real_gpg_status_codes_classify_as_expected() {
         .arg("--decrypt")
         .arg(locked.path()));
     assert_eq!(locked.read_token().await.unwrap(), TOKEN);
-    #[cfg(unix)]
     assert_eq!(
-        agent::state(&store, &["locked@example.invalid".into()])
-            .await
-            .unwrap(),
+        state("locked@example.invalid").await,
         agent::AgentState::Unlocked
     );
 }

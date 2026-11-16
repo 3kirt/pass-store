@@ -7,67 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The first release: the pass-compatible GPG token store that gitlab-mcp,
+netbox-mcp and proxmox-mcp each carry a copy of, merged into one crate with
+every review fix from all three copies. It is distributed from GitHub only
+(apps pin a release tag through git), never crates.io.
+
 ### Added
-- The pass-compatible GPG token store from gitlab-mcp, netbox-mcp and
-  proxmox-mcp, merged into one crate with every review fix from all three
-  copies: `PassStore`, `PassEntry`, `PassError`, `StoreLocation`, and the
-  `create_private_dir` / `create_private_file` / `shell_quote` helpers.
+- `PassStore`, `PassEntry` and `StoreLocation`: a `pass`-compatible store
+  driven through `gpg`.
+  - Reads never prompt: `--pinentry-mode error`, stdin closed, a 10s
+    timeout.
+  - Failures are classified from gpg's numeric status codes into
+    `PassError::{NotFound, Locked, NoSecretKey, Timeout}`. `PassError` is
+    `#[non_exhaustive]`.
+  - Writes are atomic, through an owner-only temp file claimed before gpg
+    writes to it.
+  - Recipients come from the nearest `.gpg-id`, and `~/` is expanded in
+    configured and environment paths.
 - `Branding`: the app passes its product name and CLI prefix in once, so
   "locked" and "not found" messages give advice for that app (for example
-  `proxmox-mcp --config-dir '/x' unlock`).
-- `agent`: the gpg-agent `KEYINFO` client behind `status`, plus
-  `agent::state` and `agent_status` to compose it.
-- `env`: the placeholder-aware `env_var`, `non_blank`,
+  `proxmox-mcp --config-dir '/x' unlock`). `Branding::cli_prefix` builds the
+  shell-quoted prefix.
+- The `create_private_dir`, `create_private_file` and `shell_quote`
+  helpers.
+- `agent` (Unix): the gpg-agent `KEYINFO` client behind `status`, with
+  `agent::state` for the whole check and `agent_status` for a ready status
+  line on any platform.
+- Env helpers: `env_var` (blank and unexpanded `${VAR}` placeholders count
+  as unset, with a warning), `non_blank`, `is_unset_value`,
   `is_unexpanded_placeholder`, `home_dir` and `expand_tilde`.
-- `http` feature: `LazyToken`, a pass-backed auth header. It is decrypted on
-  first use and re-read after a rejection, with a 30s backoff when that
-  re-read fails.
-- `test-support` feature: the shared fake gpg (`fake_gpg`, `ok_snippet`,
-  `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`, and a `NOPUBKEY` recipient in encrypt
-  mode), plus `lock_env`.
-- `test-support`: a fake `gpgconf` next to the fake gpg (it reports
-  `<homedir>/S.gpg-agent`), key-listing snippets passed as the recipient, and
-  a `HANG` recipient, so apps can test `status` and timeouts without writing
-  their own scripts.
-
-### Fixed
-- Dependency lower bounds are now ones the crate actually builds with:
-  `tokio` 1.26, `tempfile` 3.20 (`TempDir::keep`) and `tracing` 0.1.6. With
-  the old `"1"` / `"3"` / `"0.1"`, an app whose lockfile pinned an older
-  release failed to compile pass-store.
-- `percent-encoding` is a Unix-only dependency, like the agent client that
-  uses it, and the non-Unix build is clippy-clean.
-
-### Documentation
-- README: how to depend on the crate from git (it is distributed from GitHub
-  only, never crates.io), including the `version` key and the `deny.toml`
-  entries an app needs, and a local-checkout override.
+- `http` feature: `LazyToken`, an HTTP auth header.
+  - It is decrypted on first use, once for concurrent callers.
+  - `retry_value` re-reads it after a rejection, so the first request after
+    a token rotation can retry once.
+  - A failed re-read backs off for 30s and keeps the old token, so the
+    caller sees the server's real 401.
+- `test-support` feature, for the apps' own tests:
+  - a fake gpg whose "ciphertext" is a shell snippet (`ok_snippet`,
+    `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with `NOPUBKEY` and `HANG`
+    recipients
+  - a matching fake gpgconf for `status` tests
+  - `EnvGuard`, which sets environment variables and restores them on drop
+  - `lock_env`
 
 ### Internal
-- About 50 new unit tests: `unlock_interactive`, `agent::state` and
-  `agent_status` end to end against a scripted agent, gpgconf parsing, the
-  placeholder warning, the I/O error paths, and the backoff window.
-- `tests/public_api.rs` exercises the crate as an app does. The README
-  example compiles as a doctest, and `scripts/test-changelog.sh` tests the
-  release-notes script.
-- New CI jobs:
-  - coverage with cargo-llvm-cov, including the real-gpg test (fails under
-    97% of lines)
-  - minimal-versions (lower bounds, on the MSRV)
-  - a Windows-target clippy build
-  - real gpg on macOS too
-  - rustdoc with warnings as errors
-  - actionlint and shellcheck
-- Tests run once per feature set.
-- `make test-real-gpg` fails when the real-gpg test skipped or matched
-  nothing, instead of reporting `ok`.
-- Releases are `vX.Y.Z` tags with a GitHub release (notes, a source
-  archive, its checksum and a provenance attestation), never crates.io:
-  Cargo.toml sets `publish = false`.
-- `/release` now follows gitlab-mcp's: pre-flight checks (clean `main`,
-  green CI, an unused tag), every local gate, cargo-semver-checks against the
-  previous tag from the second release, and a consumer build against the
-  pushed tag.
-- `make consumer-smoke` (in `make check` and CI) builds a throwaway crate
-  depending on the commit through git, as the apps do. It replaces
-  `make package`.
+- About 120 unit tests, plus `tests/public_api.rs` (the API as an app uses
+  it), the README example as a doctest, and an opt-in test against the real
+  gpg (`make test-real-gpg`, which fails if the test didn't run).
+- CI runs the Makefile's targets:
+  - lint (clippy pedantic over every feature set, rustdoc, actionlint,
+    shellcheck), and the tests on ubuntu and macos
+  - real gpg on both, coverage (97% line minimum), and the MSRV (1.88)
+  - minimal dependency versions, a Windows-target build, and cargo-deny
+  - a consumer crate that depends on the commit through git
+- Releases are `vX.Y.Z` tags with a GitHub release (notes, a source archive,
+  its checksum and a provenance attestation), driven by `/release`.

@@ -1,16 +1,17 @@
 //! A minimal client for gpg-agent's Assuan protocol, used to report whether
 //! the token's decryption key is unlocked *without* decrypting anything.
 //!
-//! This is deliberately diagnostic only (an app's `status` command): the server's
-//! token reads go straight to a `--pinentry-mode error` decrypt, because
-//! "not cached" is not the same as "can't decrypt" — a passphrase-less key or
-//! a smartcard key reports uncached yet decrypts fine.
+//! This is deliberately diagnostic only (an app's `status` command): the
+//! server's token reads go straight to a `--pinentry-mode error` decrypt,
+//! because "not cached" is not the same as "can't decrypt" — a
+//! passphrase-less key or a smartcard key reports uncached yet decrypts fine.
 //!
 //! Assuan is line-based: the agent greets with `OK …`, and each command is
 //! answered by any number of `S` (status), `D` (data) and `#` (comment) lines,
 //! terminated by `OK` or `ERR <code> <description>`.
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -23,7 +24,7 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(5);
 const GPG_ERR_NOT_FOUND: u32 = 27;
 
 /// The `KEYINFO` fields this crate cares about.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyInfo {
     /// `D` = key stored on disk, `T` = smartcard, `X` = unknown.
     pub kind: char,
@@ -34,7 +35,8 @@ pub struct KeyInfo {
 }
 
 /// Summary of whether the token's key can decrypt without a prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AgentState {
     Unlocked,
     Unprotected,
@@ -48,7 +50,7 @@ impl AgentState {
     /// A one-line description for a `status` command, with `cli` (the app's
     /// command prefix, see [`crate::Branding`]) in the unlock advice.
     #[must_use]
-    pub fn describe(&self, cli: &str) -> String {
+    pub fn describe(self, cli: &str) -> String {
         match self {
             Self::Unlocked => "unlocked (passphrase cached in gpg-agent)".into(),
             Self::Unprotected => "unlocked (key has no passphrase)".into(),
@@ -99,7 +101,8 @@ pub fn summarize(infos: &[Option<KeyInfo>]) -> AgentState {
 }
 
 /// Keygrips of the encryption-capable (sub)keys for `recipients`, from
-/// `gpg --list-secret-keys --with-colons --with-keygrip`.
+/// `gpg --list-secret-keys --with-colons --with-keygrip`. No recipients
+/// means no keygrips (gpg would list the whole keyring).
 ///
 /// # Errors
 ///
@@ -108,25 +111,20 @@ pub async fn encryption_keygrips(
     store: &PassStore,
     recipients: &[String],
 ) -> Result<Vec<String>, String> {
-    let output = tokio::time::timeout(
-        AGENT_TIMEOUT,
-        store
-            .gpg_command()
-            .args([
-                "--batch",
-                "--no-tty",
-                "--with-colons",
-                "--with-keygrip",
-                "--list-secret-keys",
-                "--",
-            ])
-            .args(recipients)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "timed out listing secret keys".to_string())?
-    .map_err(|e| format!("running gpg: {e}"))?;
+    if recipients.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cmd = store.gpg_command();
+    cmd.args([
+        "--batch",
+        "--no-tty",
+        "--with-colons",
+        "--with-keygrip",
+        "--list-secret-keys",
+        "--",
+    ])
+    .args(recipients);
+    let output = run(cmd, "gpg", "listing secret keys").await?;
     // A recipient with no secret key makes gpg exit non-zero while still
     // listing the others, so parse whatever came out rather than failing.
     Ok(parse_encryption_keygrips(&String::from_utf8_lossy(
@@ -170,22 +168,27 @@ fn parse_encryption_keygrips(colons: &str) -> Vec<String> {
 ///
 /// When gpgconf can't be run, fails or times out.
 pub async fn agent_socket(store: &PassStore) -> Result<PathBuf, String> {
-    let output = tokio::time::timeout(
-        AGENT_TIMEOUT,
-        store
-            .gpgconf_command()
-            .args(["--list-dirs", "agent-socket"])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "timed out running gpgconf".to_string())?
-    .map_err(|e| format!("running gpgconf: {e}"))?;
+    let mut cmd = store.gpgconf_command();
+    cmd.args(["--list-dirs", "agent-socket"]);
+    let output = run(cmd, "gpgconf", "running gpgconf").await?;
     if !output.status.success() {
         return Err("gpgconf --list-dirs failed".into());
     }
     let raw = String::from_utf8_lossy(&output.stdout);
     Ok(PathBuf::from(percent_unescape(raw.trim())))
+}
+
+/// Run `cmd` (the `program`) under [`AGENT_TIMEOUT`], killing it on timeout.
+/// `doing` describes it for the timeout error.
+async fn run(
+    mut cmd: tokio::process::Command,
+    program: &str,
+    doing: &str,
+) -> Result<Output, String> {
+    tokio::time::timeout(AGENT_TIMEOUT, cmd.kill_on_drop(true).output())
+        .await
+        .map_err(|_| format!("timed out {doing}"))?
+        .map_err(|e| format!("running {program}: {e}"))
 }
 
 /// `gpgconf` percent-escapes some characters (e.g. `:` as `%3a`) in paths.
@@ -527,8 +530,17 @@ ERR 67108891 Not found <GPG Agent>
     /// A key-listing snippet for the fake gpg: pass its path as the
     /// recipient. Exits 2 like a real gpg missing one of several keys.
     fn listing(dir: &Path, colons: &str) -> String {
+        snippet(dir, &listing_body(colons))
+    }
+
+    fn listing_body(colons: &str) -> String {
+        format!("cat <<'EOF'\n{colons}EOF\nexit 2\n")
+    }
+
+    /// Write `body` as a snippet for the fake gpg and return its path.
+    fn snippet(dir: &Path, body: &str) -> String {
         let path = dir.join("list.sh");
-        std::fs::write(&path, format!("cat <<'EOF'\n{colons}EOF\nexit 2\n")).unwrap();
+        std::fs::write(&path, body).unwrap();
         path.display().to_string()
     }
 
@@ -560,16 +572,15 @@ ERR 67108891 Not found <GPG Agent>
     #[tokio::test]
     async fn keygrips_are_listed_for_the_recipients_even_when_gpg_fails() {
         let (home, store) = agent_store();
-        let recipient = listing(home.path(), COLONS);
         let seen = home.path().join("seen");
-        std::fs::write(
-            home.path().join("list.sh"),
-            format!(
-                "echo \"$all\" > '{}'\ncat <<'EOF'\n{COLONS}EOF\nexit 2\n",
-                seen.display()
+        let recipient = snippet(
+            home.path(),
+            &format!(
+                "echo \"$all\" > '{}'\n{}",
+                seen.display(),
+                listing_body(COLONS)
             ),
-        )
-        .unwrap();
+        );
         let grips = encryption_keygrips(&store, std::slice::from_ref(&recipient))
             .await
             .unwrap();
@@ -581,6 +592,22 @@ ERR 67108891 Not found <GPG Agent>
             )),
             "{seen}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_recipients_never_lists_the_whole_keyring() {
+        // A missing gpg would error, so Ok means gpg never ran.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PassStore::new(
+            dir.path(),
+            dir.path().join("no-gpg"),
+            crate::test_support::branding(),
+        );
+        assert_eq!(
+            encryption_keygrips(&store, &[]).await.unwrap(),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(state(&store, &[]).await.unwrap(), AgentState::NoSecretKey);
     }
 
     #[tokio::test]

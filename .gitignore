@@ -1,4 +1,7 @@
 /target
 
+# Left by an interrupted `make minimal-versions`
+/Cargo.lock.orig
+
 # Local-only Claude Code config
 .claude/settings.local.json

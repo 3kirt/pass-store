@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A library crate holding the pass-compatible GPG token store that gitlab-mcp,
 netbox-mcp and proxmox-mcp (all under `~/source/repos`, `3kirt` on GitHub)
-each used to carry a copy of. Any behavior change here reaches all three
-apps, so keep every invariant below, each with a test. A fix belongs here,
-not in an app.
+each carry a copy of today; they move onto this crate one PR per repo. Once
+they have, any behavior change here reaches all three apps, so keep every
+invariant below, each with a test. A fix belongs here, not in an app.
 
 ## Commands
 
@@ -29,8 +29,10 @@ make test-real-gpg    # REAL_GPG=1: the real-gpg test (throwaway keys); fails if
 cargo test <test_name>   # run a single test
 ```
 
-Every cargo invocation in the Makefile is `--locked`. Formatting and lint must be
-clean before every commit: `make fmt`, then `make lint`.
+Every cargo invocation in the Makefile is `--locked`, except where resolving
+is the point: `minimal-versions` re-resolves on purpose, and `consumer-smoke`
+builds a fresh throwaway crate. Formatting and lint must be clean before every
+commit: `make fmt`, then `make lint`.
 
 **CI/CD** (the same shape as the three apps): the Makefile is the single source of
 truth, and the workflows only call its targets.
@@ -49,15 +51,16 @@ truth, and the workflows only call its targets.
   green CI, an unused tag), the full local gate, cargo-semver-checks against
   the previous tag from the second release on, and a consumer build against
   the pushed tag.
-- `scheduled.yml` runs weekly: deny, msrv, stable/beta drift and real gpg on
-  ubuntu and macos. A failure opens a `scheduled-failure` issue.
+- `scheduled.yml` runs weekly: deny, msrv, minimal-versions, stable/beta drift
+  and real gpg on ubuntu and macos. A failure opens a `scheduled-failure`
+  issue.
 - Actions are pinned by commit SHA, with a `# vX.Y.Z` comment.
 
 The toolchain is pinned in `rust-toolchain.toml` (1.100.0). The MSRV is
 `rust-version` in Cargo.toml (1.88, the lowest of the three apps); keep it
-buildable. cargo-deny bans aws-lc-sys/aws-lc-rs, allows crates.io sources only
-(for this crate's own dependencies),
-and lists only licenses actually in the tree. A new license must be
+buildable. cargo-deny bans aws-lc-sys/aws-lc-rs, allows only crates.io as a
+source for this crate's own dependencies, and lists only licenses actually in
+the tree. A new license must be
 GPL-3.0-compatible before it goes into `deny.toml`. The crate is
 GPL-3.0-or-later, which fits proxmox and gitlab (GPL-3.0-only) and netbox
 (GPL-3.0-or-later). CHANGELOG headings are `## [X.Y.Z] - YYYY-MM-DD`.
@@ -85,10 +88,29 @@ Every invariant below has a unit test; a fix comes with a regression test.
 - **Lower bounds:** when code starts using a newer dependency API, raise
   that dependency's lower bound in Cargo.toml; `make minimal-versions`
   catches it.
+- **The fake gpg** (`test_support`) is one script written once. Decrypt and
+  key-listing modes *source* their last argument (the entry file, or a
+  snippet passed as the recipient). Encrypt mode records argv in
+  `<output>.args`; a `NOPUBKEY` recipient exits without reading stdin, and
+  `HANG` hangs. The fake gpgconf next to it sources `<homedir>/gpgconf.sh`
+  and exits when that exists, and otherwise answers `--list-dirs
+  agent-socket` with `<homedir>/S.gpg-agent`.
 - **Never write an executable at test time.** Use the shared fake
   gpg/gpgconf: writing and then executing a script races with other tests'
   spawns (ETXTBSY on Linux). On macOS a just-closed fd or listener can also
   leak briefly into another test's child process.
+- A snippet that outlives its timeout must use `exec sleep 10`, not plain
+  `sleep`: on macOS an orphaned child can hold another test's pipe open for
+  10s.
+- **The environment:** change it only through `test_support::EnvGuard`,
+  which holds `lock_env()` and restores every variable on drop, panics
+  included. Hold `lock_env()` around anything that only reads it (e.g.
+  resolving a store).
+- **`real_gpg.rs`** generates a passphrase-less key, a protected key and a
+  foreign key in a short GNUPGHOME from TMPDIR (prefix `psg`: macOS limits
+  socket paths to 104 bytes). It runs `gpgconf --reload` after keygen and
+  `--kill` on drop, and asserts DECRYPTION_OKAY, Locked (85), NoSecretKey
+  (17), the agent states, and a successful read once the cache is primed.
 
 ## Layout
 
@@ -96,13 +118,17 @@ Every invariant below has a unit test; a fix comes with a regression test.
 src/
   lib.rs          — re-exports; agent_status() (one status line, any platform)
   store.rs        — Branding, PassStore, PassEntry, PassError, StoreLocation, read/write/recipients, helpers
-  env.rs          — env_var / non_blank / is_unexpanded_placeholder / home_dir / expand_tilde
+  env.rs          — env_var / non_blank / is_unset_value / is_unexpanded_placeholder / home_dir / expand_tilde
   agent.rs        — (unix) gpg-agent Assuan KEYINFO client, used only by `status`
   token.rs        — (feature http) LazyToken
-  test_support.rs — (test or feature test-support) fake gpg, snippets, lock_env
-  real_gpg.rs     — (#[ignore], REAL_GPG=1) the real-gpg classification test
-tests/public_api.rs — the public API as an app uses it
-scripts/        — changelog-section.sh (release notes) and its test, consumer-smoke.sh
+  test_support.rs — (test or feature test-support) fake gpg and gpgconf, snippets, EnvGuard, lock_env
+  real_gpg.rs     — (unix, #[ignore], REAL_GPG=1) the real-gpg classification test
+tests/
+  public_api.rs   — the public API as an app uses it
+scripts/
+  changelog-section.sh — release notes for one version (release.yml)
+  test-changelog.sh    — its test, and CHANGELOG.md's heading shape
+  consumer-smoke.sh    — a throwaway crate depending on a commit or tag through git
 ```
 
 ## Branding
@@ -120,6 +146,8 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
 ## Invariants (all three apps rely on these)
 
 **Read path (never prompts)**
+- A missing entry is `NotFound` ("run `{cli} login`") for both `read_token`
+  and `unlock_interactive`, before gpg runs.
 - Decrypt runs `gpg --batch --quiet --no-tty --pinentry-mode error --status-fd 2
   --decrypt -- P` with stdin null, under a 10s timeout, with `kill_on_drop`.
 - Classify only from the numeric `[GNUPG:] ERROR <loc> <code>` codes, taking the
@@ -134,7 +162,8 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
 - Recipients come from the nearest ancestor `.gpg-id`, stopping at the store
   root, with everything after `#` stripped.
 - `init` never overwrites a root `.gpg-id`.
-- `resolve` expands `~/` and makes the root and homedir absolute
+- `resolve` expands `~/` (in configured values and in `$PASSWORD_STORE_DIR` /
+  `$GNUPGHOME`) and makes the root and homedir absolute
   (`std::path::absolute`). Blank or `${…}` placeholder env vars count as
   unset.
 - gpgconf comes from the same directory as an explicitly configured gpg.
@@ -143,14 +172,18 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
 - Claim `.<entry>.gpg.tmp<pid>` with `create_new` at 0600 *before* gpg's
   `--yes --output`, so a planted file or symlink fails the write. Only delete a
   temp file this call created. Chmod it to 0600, then rename it atomically into
-  place. Directories are 0700.
+  place. Directories it creates are 0700; an existing directory keeps its
+  mode.
+- It refuses an empty recipient list up front, and a timeout names the
+  entry, not the temp file.
 - The stdin write and the wait run together under the timeout, and BrokenPipe
   is ignored, so the user sees gpg's own "No public key", not "Broken pipe".
 
 **agent.rs**
 - Keygrips come from `--with-colons --with-keygrip --list-secret-keys`. Only a
   lowercase `e` capability counts, and subkeys with validity (field 2) `e`,
-  `r`, `d` or `i` are skipped.
+  `r`, `d` or `i` are skipped. No recipients means no keygrips: gpg must
+  never be asked to list the whole keyring.
 - Paths from `gpgconf --list-dirs agent-socket` are percent-unescaped.
 - A keygrip is hex-validated before it is sent.
 - `ERR` code 27 means "not held".
@@ -170,22 +203,3 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
   statuses (401 by default; netbox adds 403).
 - The rotation retry stays in each app's `send()`, using `retry_value`. Add the
   header per attempt, because reqwest's `.header()` appends.
-
-**Tests**
-- The fake gpg (`test_support`) is one script written once, which avoids
-  ETXTBSY races. Decrypt and key-listing modes *source* their last argument
-  (the entry file, or a snippet passed as the recipient); encrypt mode
-  records argv in `<output>.args`; a `NOPUBKEY` recipient exits without
-  reading stdin, and `HANG` hangs. The fake gpgconf next to it answers
-  `--list-dirs agent-socket` with `<homedir>/S.gpg-agent` or sources
-  `<homedir>/gpgconf.sh`.
-- A snippet that outlives its timeout must use `exec sleep 10`, not plain
-  `sleep`: on macOS an orphaned child can hold another test's pipe open for
-  10s.
-- Hold `test_support::lock_env()` around any env mutation, and around anything
-  that resolves a store from the environment.
-- `real_gpg.rs` generates a passphrase-less key, a protected key and a foreign
-  key in a short GNUPGHOME from TMPDIR (prefix `psg`: macOS limits socket
-  paths to 104 bytes). It runs `gpgconf --reload` after keygen and `--kill` on
-  drop, and asserts DECRYPTION_OKAY, Locked (85), NoSecretKey (17), the agent
-  states, and a successful read once the cache is primed.

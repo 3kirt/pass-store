@@ -103,6 +103,7 @@ async fn lazy_token_with_an_app_header() {
 }
 
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)]
 fn env_helpers_are_public() {
     assert!(pass_store::is_unexpanded_placeholder("${EXAMPLE_TOKEN}"));
     assert_eq!(pass_store::non_blank(Some("  ".into())), None);
@@ -110,9 +111,15 @@ fn env_helpers_are_public() {
         pass_store::env_var("PASS_STORE_SURELY_UNSET_VARIABLE"),
         None
     );
-    let _guard = pass_store::test_support::lock_env();
-    assert!(pass_store::home_dir().is_ok());
+    assert!(pass_store::is_unset_value(" ${EXAMPLE_TOKEN:-} "));
     assert_eq!(pass_store::shell_quote("a b"), "'a b'");
+    let mut env = pass_store::test_support::EnvGuard::new();
+    env.set("HOME", "/home/example");
+    assert_eq!(pass_store::home_dir().unwrap(), Path::new("/home/example"));
+    assert_eq!(
+        pass_store::expand_tilde("~/x").unwrap(),
+        Path::new("/home/example/x")
+    );
 }
 
 #[tokio::test]

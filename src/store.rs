@@ -26,6 +26,7 @@ const GPG_ERR_CANCELED: u32 = 99;
 const MAX_GPG_MESSAGE: usize = 300;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PassError {
     /// `cli` is the command prefix that reaches the app's own config (see
     /// [`Branding`]), so the advice works for a non-default config.
@@ -56,8 +57,17 @@ pub enum PassError {
     },
     #[error("no secret key in this GnuPG keyring can decrypt {}", path.display())]
     NoSecretKey { path: PathBuf },
-    #[error("gpg did not finish decrypting {} within {}s", path.display(), timeout.as_secs())]
-    Timeout { path: PathBuf, timeout: Duration },
+    /// `operation` is what gpg was doing: "decrypting" or "encrypting".
+    #[error(
+        "gpg did not finish {operation} {} within {}s",
+        path.display(),
+        timeout.as_secs()
+    )]
+    Timeout {
+        operation: &'static str,
+        path: PathBuf,
+        timeout: Duration,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -118,11 +128,11 @@ pub struct PassStore {
 
 /// Where the store and keyring live, as configured.
 ///
-/// Each `None` falls back to the process environment, then the default.
-/// The config values exist
-/// because MCP clients launched from a GUI (e.g. from the macOS Dock) don't
-/// inherit shell-only `PASSWORD_STORE_DIR` / `GNUPGHOME` exports; `login`
-/// records what it used so the server reads the same store and keyring.
+/// Each `None` falls back to the process environment, then the default. The
+/// config values exist because MCP clients launched from a GUI (e.g. from
+/// the macOS Dock) don't inherit shell-only `PASSWORD_STORE_DIR` /
+/// `GNUPGHOME` exports; `login` records what it used so the server reads the
+/// same store and keyring.
 #[derive(Debug, Default, Clone)]
 pub struct StoreLocation<'a> {
     /// gpg binary (default: `gpg` from `PATH`, which a minimal client
@@ -136,9 +146,11 @@ pub struct StoreLocation<'a> {
 }
 
 impl PassStore {
-    /// The store at `loc`, with `~/` expanded and the root and homedir made
-    /// absolute (so the paths `login` records mean the same thing to a
-    /// server started from another working directory).
+    /// The store at `loc`, with `~/` expanded (in configured values and in
+    /// `$PASSWORD_STORE_DIR` / `$GNUPGHOME`, which a GUI client's config may
+    /// hold unexpanded) and the root and homedir made absolute (so the paths
+    /// `login` records mean the same thing to a server started from another
+    /// working directory).
     ///
     /// # Errors
     ///
@@ -146,17 +158,19 @@ impl PassStore {
     /// made absolute.
     pub fn resolve(loc: &StoreLocation<'_>, branding: Branding) -> Result<Self, PassError> {
         let path_err = |e: std::io::Error| PassError::Other(format!("resolving the store: {e}"));
-        let root = match loc.store_dir {
-            Some(dir) => expand_tilde(dir).map_err(path_err)?,
-            None => match env_var("PASSWORD_STORE_DIR") {
-                Some(dir) => expand_tilde(&dir).map_err(path_err)?,
-                None => home_dir().map_err(path_err)?.join(".password-store"),
-            },
+        let configured = |value: Option<&str>, var: &str| {
+            value
+                .map(str::to_string)
+                .or_else(|| env_var(var))
+                .map(|v| expand_tilde(&v))
+                .transpose()
+                .map_err(path_err)
         };
-        let homedir = match loc.gnupg_home {
-            Some(dir) => Some(expand_tilde(dir).map_err(path_err)?),
-            None => env_var("GNUPGHOME").map(PathBuf::from),
+        let root = match configured(loc.store_dir, "PASSWORD_STORE_DIR")? {
+            Some(dir) => dir,
+            None => home_dir().map_err(path_err)?.join(".password-store"),
         };
+        let homedir = configured(loc.gnupg_home, "GNUPGHOME")?;
         let root = std::path::absolute(&root).map_err(path_err)?;
         let homedir = homedir
             .map(std::path::absolute)
@@ -226,18 +240,18 @@ impl PassStore {
     /// A `gpg` command with `--homedir` applied.
     #[must_use]
     pub fn gpg_command(&self) -> Command {
-        let mut cmd = Command::new(&self.gpg);
-        if let Some(home) = &self.homedir {
-            cmd.arg("--homedir").arg(home);
-        }
-        cmd
+        self.command_with_homedir(&self.gpg)
     }
 
     /// A `gpgconf` command with `--homedir` applied (so the agent socket it
     /// reports belongs to the same keyring).
     #[must_use]
     pub fn gpgconf_command(&self) -> Command {
-        let mut cmd = Command::new(self.gpgconf());
+        self.command_with_homedir(&self.gpgconf())
+    }
+
+    fn command_with_homedir(&self, program: &Path) -> Command {
+        let mut cmd = Command::new(program);
         if let Some(home) = &self.homedir {
             cmd.arg("--homedir").arg(home);
         }
@@ -308,6 +322,23 @@ impl PassStore {
             cli: self.branding.cli.clone(),
         }
     }
+
+    fn locked(&self, path: PathBuf) -> PassError {
+        PassError::Locked {
+            product: self.branding.product.clone(),
+            gpg_decrypt: self.gpg_decrypt_command(&path),
+            cli: self.branding.cli.clone(),
+            path,
+        }
+    }
+
+    const fn timeout(&self, operation: &'static str, path: PathBuf) -> PassError {
+        PassError::Timeout {
+            operation,
+            path,
+            timeout: self.timeout,
+        }
+    }
 }
 
 /// One token entry in a [`PassStore`].
@@ -346,13 +377,7 @@ impl PassEntry {
     /// [`PassError::Timeout`] when gpg hangs, and [`PassError::Other`] for
     /// anything else, including an empty first line.
     pub async fn read_token(&self) -> Result<String, PassError> {
-        let path = self.path();
-        if !tokio::fs::try_exists(&path)
-            .await
-            .map_err(|e| io_err("checking", &path, &e))?
-        {
-            return Err(self.store.not_found(&self.name, path));
-        }
+        let path = self.existing_path().await?;
 
         let child = self
             .store
@@ -378,23 +403,13 @@ impl PassEntry {
             .map_err(|e| spawn_err(&self.store.gpg, &e))?;
         let output = tokio::time::timeout(self.store.timeout, child.wait_with_output())
             .await
-            .map_err(|_| PassError::Timeout {
-                path: path.clone(),
-                timeout: self.store.timeout,
-            })?
+            .map_err(|_| self.store.timeout("decrypting", path.clone()))?
             .map_err(|e| io_err("waiting for gpg on", &path, &e))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         match classify_decrypt(output.status.success(), &stderr) {
             DecryptOutcome::Ok => {}
-            DecryptOutcome::Locked => {
-                return Err(PassError::Locked {
-                    product: self.store.branding.product.clone(),
-                    gpg_decrypt: self.store.gpg_decrypt_command(&path),
-                    cli: self.store.branding.cli.clone(),
-                    path,
-                });
-            }
+            DecryptOutcome::Locked => return Err(self.store.locked(path)),
             DecryptOutcome::NoSecretKey => return Err(PassError::NoSecretKey { path }),
             DecryptOutcome::Failed => {
                 return Err(PassError::Other(format!(
@@ -417,6 +432,19 @@ impl PassEntry {
             )));
         }
         Ok(token.to_string())
+    }
+
+    /// The entry's path, or [`PassError::NotFound`] when there is no file.
+    async fn existing_path(&self) -> Result<PathBuf, PassError> {
+        let path = self.path();
+        if tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| io_err("checking", &path, &e))?
+        {
+            Ok(path)
+        } else {
+            Err(self.store.not_found(&self.name, path))
+        }
     }
 
     /// Recipients from the nearest `.gpg-id`, walking up from the entry's
@@ -461,13 +489,24 @@ impl PassEntry {
     /// Encrypt `token` to `recipients` and atomically (temp file + rename)
     /// replace the entry. Encryption needs only public keys, so no pinentry.
     ///
+    /// The temp file is `.<entry>.gpg.tmp<pid>`, so two writes of the same
+    /// entry from one process at once fail the second with "creating …";
+    /// separate processes (e.g. two `login` runs) don't collide.
+    ///
     /// # Errors
     ///
-    /// When a directory or the temp file can't be created (including when
-    /// something is already at the temp path), gpg fails (its own message,
-    /// e.g. "No public key", is forwarded) or times out, or the rename fails.
+    /// When `recipients` is empty, a directory or the temp file can't be
+    /// created (including when something is already at the temp path), gpg
+    /// fails (its own message, e.g. "No public key", is forwarded) or times
+    /// out, or the rename fails.
     pub async fn write_token(&self, token: &str, recipients: &[String]) -> Result<(), PassError> {
         let path = self.path();
+        if recipients.is_empty() {
+            return Err(PassError::Other(format!(
+                "no GPG recipients to encrypt {} to",
+                path.display()
+            )));
+        }
         let dir = path
             .parent()
             .ok_or_else(|| PassError::Other(format!("{} has no parent", path.display())))?;
@@ -483,7 +522,7 @@ impl PassEntry {
         drop(create_private_file(&tmp)?);
 
         let outcome = self
-            .encrypt_to(&tmp, token, recipients)
+            .encrypt_to(&tmp, &path, token, recipients)
             .await
             .and_then(|()| {
                 restrict(&tmp)?;
@@ -496,13 +535,15 @@ impl PassEntry {
         outcome
     }
 
-    /// Run `gpg --encrypt` for `recipients` into `out`, the stdin write and
-    /// the wait both under the timeout. A gpg that exits early (e.g. no
-    /// public key for a recipient) closes its stdin; that broken pipe is
-    /// ignored so the caller sees gpg's own error from stderr instead.
+    /// Run `gpg --encrypt` for `recipients` into `out` (the temp file for
+    /// `entry`, which errors name), the stdin write and the wait both under
+    /// the timeout. A gpg that exits early (e.g. no public key for a
+    /// recipient) closes its stdin; that broken pipe is ignored so the caller
+    /// sees gpg's own error from stderr instead.
     async fn encrypt_to(
         &self,
         out: &Path,
+        entry: &Path,
         token: &str,
         recipients: &[String],
     ) -> Result<(), PassError> {
@@ -524,7 +565,7 @@ impl PassEntry {
             if let Some(mut stdin) = stdin {
                 match stdin.write_all(format!("{token}\n").as_bytes()).await {
                     Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
-                        return Err(io_err("writing to gpg for", out, &e));
+                        return Err(io_err("writing to gpg for", entry, &e));
                     }
                     _ => {}
                 }
@@ -534,14 +575,11 @@ impl PassEntry {
             child
                 .wait_with_output()
                 .await
-                .map_err(|e| io_err("waiting for gpg on", out, &e))
+                .map_err(|e| io_err("waiting for gpg on", entry, &e))
         };
         let output = tokio::time::timeout(self.store.timeout, exchange)
             .await
-            .map_err(|_| PassError::Timeout {
-                path: out.to_path_buf(),
-                timeout: self.store.timeout,
-            })??;
+            .map_err(|_| self.store.timeout("encrypting", entry.to_path_buf()))??;
         if output.status.success() {
             Ok(())
         } else {
@@ -576,9 +614,10 @@ impl PassEntry {
     ///
     /// # Errors
     ///
-    /// When gpg can't be run or doesn't decrypt.
+    /// [`PassError::NotFound`] when the entry doesn't exist; otherwise when
+    /// gpg can't be run or doesn't decrypt.
     pub async fn unlock_interactive(&self) -> Result<(), PassError> {
-        let path = self.path();
+        let path = self.existing_path().await?;
         let status = self
             .store
             .gpg_command()
@@ -756,7 +795,8 @@ fn spawn_err(gpg: &Path, e: &std::io::Error) -> PassError {
 mod tests {
     use super::*;
     use crate::test_support::{
-        LOCKED_SNIPPET, NO_SECKEY_SNIPPET, branding, fake_gpg, lock_env, ok_snippet, store,
+        EnvGuard, LOCKED_SNIPPET, NO_SECKEY_SNIPPET, branding, fake_gpg, lock_env, ok_snippet,
+        store,
     };
 
     fn store_with(name: &str, snippet: &str) -> (tempfile::TempDir, PassEntry) {
@@ -1084,23 +1124,12 @@ mod tests {
         let args = args_file(&parent);
         assert!(args.contains("--recipient K1 --recipient K2"), "{args}");
         assert!(args.contains("--yes"), "{args}");
-        // Only the entry and the fake's .args remain: the temp file was renamed.
-        let names: Vec<String> = std::fs::read_dir(&parent)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| Path::new(n).extension().is_none_or(|e| e != "args"))
-            .collect();
-        assert_eq!(names, vec!["host.example.com.gpg"]);
+        // Only the entry remains: the temp file was renamed.
+        assert_eq!(names(&parent), vec!["host.example.com.gpg"]);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode();
-            assert_eq!(
-                mode(&entry.path()) & 0o077,
-                0,
-                "entry is group/world accessible"
-            );
-            assert_eq!(mode(&parent) & 0o777, 0o700, "entry dir is not 0700");
+            assert_eq!(mode(&entry.path()), 0o600);
+            assert_eq!(mode(&parent), 0o700);
         }
     }
 
@@ -1126,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn hung_encrypt_times_out_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path()).with_timeout(Duration::from_millis(200));
+        let store = store(dir.path()).with_timeout(Duration::from_secs(1));
         let entry = store.entry("t").unwrap();
         let start = std::time::Instant::now();
         // Bigger than a pipe buffer: the stdin write itself must be bounded.
@@ -1134,8 +1163,15 @@ mod tests {
             .write_token(&"x".repeat(1 << 20), &["HANG".into()])
             .await
             .unwrap_err();
-        assert!(matches!(err, PassError::Timeout { .. }), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
+        // Names the entry, not the temp file, and what gpg was doing.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "gpg did not finish encrypting {} within 1s",
+                entry.path().display()
+            )
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -1276,31 +1312,22 @@ mod tests {
 
     #[test]
     fn configured_location_beats_environment() {
-        let _guard = lock_env();
-        // SAFETY: lock_env() serializes every env access in this crate's tests.
-        unsafe {
-            std::env::set_var("PASSWORD_STORE_DIR", "/env/store");
-            std::env::set_var("GNUPGHOME", "/env/gnupg");
-        }
-        let configured = PassStore::resolve(
+        let mut env = EnvGuard::new();
+        env.set("PASSWORD_STORE_DIR", "/env/store")
+            .set("GNUPGHOME", "/env/gnupg");
+        let store = PassStore::resolve(
             &StoreLocation {
                 gpg: Some("/opt/gpg/bin/gpg"),
                 store_dir: Some("/stores/pass"),
                 gnupg_home: Some("/keys/gnupg"),
             },
             branding(),
-        );
-        let from_env = PassStore::resolve(&StoreLocation::default(), branding());
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("PASSWORD_STORE_DIR");
-            std::env::remove_var("GNUPGHOME");
-        }
-        let store = configured.unwrap();
+        )
+        .unwrap();
         assert_eq!(store.root(), Path::new("/stores/pass"));
         assert_eq!(store.homedir(), Some(Path::new("/keys/gnupg")));
         assert_eq!(store.gpgconf(), PathBuf::from("/opt/gpg/bin/gpgconf"));
-        let store = from_env.unwrap();
+        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
         assert_eq!(store.root(), Path::new("/env/store"));
         assert_eq!(store.homedir(), Some(Path::new("/env/gnupg")));
     }
@@ -1308,19 +1335,10 @@ mod tests {
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)]
     fn placeholder_env_falls_back_to_the_default_store() {
-        let _guard = lock_env();
-        // SAFETY: lock_env() serializes every env access in this crate's tests.
-        unsafe {
-            std::env::set_var("PASSWORD_STORE_DIR", "${PASSWORD_STORE_DIR}");
-            std::env::set_var("GNUPGHOME", "  ");
-        }
-        let resolved = PassStore::resolve(&StoreLocation::default(), branding());
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("PASSWORD_STORE_DIR");
-            std::env::remove_var("GNUPGHOME");
-        }
-        let store = resolved.unwrap();
+        let mut env = EnvGuard::new();
+        env.set("PASSWORD_STORE_DIR", "${PASSWORD_STORE_DIR}")
+            .set("GNUPGHOME", "  ");
+        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
         assert_eq!(
             store.root(),
             crate::env::home_dir().unwrap().join(".password-store")
@@ -1593,58 +1611,39 @@ mod tests {
 
     #[test]
     fn resolve_without_a_home_needs_explicit_paths() {
-        let _guard = lock_env();
-        let saved: Vec<_> = ["HOME", "USERPROFILE", "PASSWORD_STORE_DIR"]
-            .iter()
-            .map(|v| (*v, std::env::var_os(v)))
-            .collect();
-        // SAFETY: lock_env() serializes every env access in this crate's tests.
-        unsafe {
-            for (v, _) in &saved {
-                std::env::remove_var(v);
-            }
+        let mut env = EnvGuard::new();
+        for var in ["HOME", "USERPROFILE", "PASSWORD_STORE_DIR", "GNUPGHOME"] {
+            env.remove(var);
         }
-        let default = PassStore::resolve(&StoreLocation::default(), branding());
-        let tilde = PassStore::resolve(
-            &StoreLocation {
-                store_dir: Some("~/store"),
-                ..StoreLocation::default()
-            },
-            branding(),
-        );
-        let explicit = PassStore::resolve(
-            &StoreLocation {
-                store_dir: Some("/stores/pass"),
-                ..StoreLocation::default()
-            },
-            branding(),
-        );
-        // SAFETY: as above.
-        unsafe {
-            for (v, val) in &saved {
-                if let Some(val) = val {
-                    std::env::set_var(v, val);
-                }
-            }
-        }
-        let msg = default.unwrap_err().to_string();
+        let msg = PassStore::resolve(&StoreLocation::default(), branding())
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("home directory"), "{msg}");
-        assert!(tilde.is_err());
-        assert_eq!(explicit.unwrap().root(), Path::new("/stores/pass"));
+        let tilde = StoreLocation {
+            store_dir: Some("~/store"),
+            ..StoreLocation::default()
+        };
+        assert!(PassStore::resolve(&tilde, branding()).is_err());
+        let explicit = StoreLocation {
+            store_dir: Some("/stores/pass"),
+            ..StoreLocation::default()
+        };
+        assert_eq!(
+            PassStore::resolve(&explicit, branding()).unwrap().root(),
+            Path::new("/stores/pass")
+        );
     }
 
     #[test]
-    fn password_store_dir_env_expands_tilde() {
-        let _guard = lock_env();
-        // SAFETY: lock_env() serializes every env access in this crate's tests.
-        unsafe { std::env::set_var("PASSWORD_STORE_DIR", "~/env-store") };
-        let resolved = PassStore::resolve(&StoreLocation::default(), branding());
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("PASSWORD_STORE_DIR") };
-        assert_eq!(
-            resolved.unwrap().root(),
-            crate::env::home_dir().unwrap().join("env-store")
-        );
+    fn environment_paths_expand_tilde() {
+        let mut env = EnvGuard::new();
+        env.set("PASSWORD_STORE_DIR", "~/env-store")
+            .set("GNUPGHOME", "~/env-gnupg");
+        let home = crate::env::home_dir().unwrap();
+        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
+        assert_eq!(store.root(), home.join("env-store"));
+        // Not `<cwd>/~/env-gnupg`: gpg itself would expand `~/` here.
+        assert_eq!(store.homedir(), Some(home.join("env-gnupg").as_path()));
     }
 
     #[test]
@@ -1719,13 +1718,31 @@ mod tests {
     async fn unlock_with_a_missing_gpg_names_the_config_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = PassStore::new(dir.path(), dir.path().join("no-such-gpg"), branding());
-        let msg = store
-            .entry("t")
+        let entry = store.entry("t").unwrap();
+        std::fs::write(entry.path(), "").unwrap();
+        let msg = entry.unlock_interactive().await.unwrap_err().to_string();
+        assert!(msg.contains("\"gpg\""), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn unlock_of_a_missing_entry_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = store(dir.path())
+            .entry("nope")
             .unwrap()
             .unlock_interactive()
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("\"gpg\""), "{msg}");
+            .unwrap_err();
+        assert!(matches!(err, PassError::NotFound { .. }), "{err}");
+        assert!(err.to_string().contains("`test-mcp login`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn write_token_needs_a_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = store(dir.path()).entry("t").unwrap();
+        let msg = entry.write_token("tok", &[]).await.unwrap_err().to_string();
+        assert!(msg.starts_with("no GPG recipients"), "{msg}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

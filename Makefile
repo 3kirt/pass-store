@@ -1,6 +1,8 @@
 # Single source of truth for local and CI checks: the workflows only call
 # these targets. `make check` is the pre-release gate. Every cargo invocation
-# is --locked, except `minimal-versions`, which re-resolves on purpose.
+# is --locked, except where resolving is the point: `minimal-versions`
+# re-resolves to the oldest allowed dependencies, and `consumer-smoke` builds
+# a fresh throwaway crate.
 
 MSRV := $(shell sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
 
@@ -93,11 +95,9 @@ msrv:
 # builds with those. Cargo.lock is restored afterwards.
 minimal-versions:
 	@cp Cargo.lock Cargo.lock.orig; \
-	status=0; \
+	trap 'mv Cargo.lock.orig Cargo.lock' EXIT; \
 	cargo +nightly update -Z direct-minimal-versions && \
-		cargo +$(MSRV) test --locked --all-features || status=$$?; \
-	mv Cargo.lock.orig Cargo.lock; \
-	exit $$status
+		cargo +$(MSRV) test --locked --all-features
 
 # Compiles everything, tests included, for a non-Unix target (needs
 # `rustup target add $(WINDOWS_TARGET)`). The suite itself is Unix-only.

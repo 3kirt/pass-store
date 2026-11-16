@@ -43,6 +43,7 @@ use crate::{PassEntry, PassError};
 pub const REREAD_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TokenError {
     #[error(transparent)]
     Pass(#[from] PassError),

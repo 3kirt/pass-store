@@ -55,15 +55,15 @@ pub fn env_var(name: &str) -> Option<String> {
     non_blank(Some(raw))
 }
 
-/// `$HOME`, else `%USERPROFILE%`.
+/// `$HOME`, else `%USERPROFILE%`; an empty value counts as unset.
 ///
 /// # Errors
 ///
 /// [`std::io::ErrorKind::NotFound`] when neither variable is set.
 pub fn home_dir() -> std::io::Result<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|h| !h.is_empty())
+    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+    set("HOME")
+        .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| {
             std::io::Error::new(
@@ -89,7 +89,7 @@ pub fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::lock_env;
+    use crate::test_support::{EnvGuard, lock_env};
 
     #[test]
     // `${X:-}` etc. are shell-style placeholders under test, not format args.
@@ -132,7 +132,7 @@ mod tests {
     #[allow(clippy::literal_string_with_formatting_args)]
     fn env_var_treats_placeholders_and_blanks_as_unset() {
         const VAR: &str = "PASS_STORE_TEST_ENV_VAR";
-        let _guard = lock_env();
+        let mut env = EnvGuard::new();
         let cases = [
             ("${PASS_STORE_TEST_ENV_VAR}", None),
             ("${PASS_STORE_TEST_ENV_VAR:-x}", None),
@@ -140,12 +140,10 @@ mod tests {
             ("value", Some("value")),
         ];
         for (raw, want) in cases {
-            // SAFETY: lock_env() serializes every env access in this crate's tests.
-            unsafe { std::env::set_var(VAR, raw) };
+            env.set(VAR, raw);
             assert_eq!(env_var(VAR).as_deref(), want, "{raw:?}");
         }
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(VAR) };
+        env.remove(VAR);
         assert_eq!(env_var(VAR), None);
     }
 
@@ -175,37 +173,17 @@ mod tests {
 
     #[test]
     fn home_dir_falls_back_to_userprofile_and_ignores_empty() {
-        let _guard = lock_env();
-        let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
-        // SAFETY: lock_env() serializes every env access in this crate's tests.
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::set_var("USERPROFILE", "/profile");
-        }
-        let fallback = home_dir();
-        // SAFETY: as above.
-        unsafe {
-            std::env::set_var("HOME", "");
-            std::env::remove_var("USERPROFILE");
-        }
-        let empty = home_dir();
-        let tilde = expand_tilde("~/x");
-        let plain = expand_tilde("/abs");
-        // SAFETY: as above.
-        unsafe {
-            match &saved.0 {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-            if let Some(p) = &saved.1 {
-                std::env::set_var("USERPROFILE", p);
-            }
-        }
-        assert_eq!(fallback.unwrap(), PathBuf::from("/profile"));
-        assert_eq!(empty.unwrap_err().kind(), std::io::ErrorKind::NotFound);
-        assert!(tilde.is_err());
+        let mut env = EnvGuard::new();
+        env.remove("HOME").set("USERPROFILE", "/profile");
+        assert_eq!(home_dir().unwrap(), PathBuf::from("/profile"));
+        // An empty HOME counts as unset, so USERPROFILE still applies.
+        env.set("HOME", "");
+        assert_eq!(home_dir().unwrap(), PathBuf::from("/profile"));
+        env.set("USERPROFILE", "");
+        assert_eq!(home_dir().unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(expand_tilde("~/x").is_err());
         // A path without `~` never needs the home directory.
-        assert_eq!(plain.unwrap(), PathBuf::from("/abs"));
+        assert_eq!(expand_tilde("/abs").unwrap(), PathBuf::from("/abs"));
     }
 
     #[test]
@@ -255,18 +233,15 @@ mod tests {
     #[allow(clippy::literal_string_with_formatting_args)]
     fn a_placeholder_warns_but_a_blank_does_not() {
         const VAR: &str = "PASS_STORE_TEST_WARN_VAR";
-        let _guard = lock_env();
+        let mut env = EnvGuard::new();
         let warnings = std::sync::Arc::new(Warnings::default());
-        let read = |raw: &str| {
-            // SAFETY: lock_env() serializes every env access in this crate's tests.
-            unsafe { std::env::set_var(VAR, raw) };
+        let mut read = |raw: &str| {
+            env.set(VAR, raw);
             tracing::subscriber::with_default(warnings.clone(), || env_var(VAR))
         };
         assert_eq!(read("${PASS_STORE_TEST_WARN_VAR}"), None);
         assert_eq!(read("   "), None);
         assert_eq!(read("set"), Some("set".into()));
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(VAR) };
         assert_eq!(*warnings.0.lock().unwrap(), vec![VAR.to_string()]);
     }
 }
