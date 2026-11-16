@@ -1,6 +1,6 @@
 [package]
 name = "pass-store"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The lowest of the apps that depend on this crate (proxmox-mcp).
 rust-version = "1.88"

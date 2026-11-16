@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+Settles the API before any app ships on the crate. Upgrading from 0.1:
+- Pass `&StoreEnv::from_process()` as `resolve`'s new second argument.
+- Switch any `pass_store::env::…` paths to the crate root.
+- Map `agent::state`'s error with `to_string()` if you need a `String`.
+- Tests that only resolve a store can build a `StoreEnv` instead of taking
+  the env lock.
+
 ### Changed
 - **Breaking:** `PassStore::resolve` takes the environment it falls back to
   as a new `&StoreEnv` argument: `resolve(&loc, &env, branding)`. It no
@@ -34,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   environment lock. A separate app lock doesn't exclude pass-store's reads
   of `HOME` / `PASSWORD_STORE_DIR` / `GNUPGHOME`. They also say how to hold
   it in an async test.
+
+### Internal
+- `scripts/consumer-smoke.sh` takes the dependency's version from the commit
+  under test, not the work tree, so it works with an uncommitted version
+  bump.
 
 ## [0.1.0] - 2026-11-16
 
