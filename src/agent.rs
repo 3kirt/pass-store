@@ -371,6 +371,10 @@ grp:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("S.gpg-agent");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        // On macOS a process another test spawns at that moment can inherit
+        // the listener (spawn isn't atomic with CLOEXEC there) and keep it
+        // accepting until its exec. Let that window pass.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let got = query_socket(&path, &[GRIP_B.into()]).await.unwrap();
         assert_eq!(got, None);
     }
@@ -509,5 +513,259 @@ ERR 67108891 Not found <GPG Agent>
             percent_unescape("/x/a%3ab/S.gpg-agent"),
             "/x/a:b/S.gpg-agent"
         );
+    }
+
+    /// A store on the fake gpg/gpgconf whose GnuPG home is a fresh temp dir
+    /// (so the fake gpgconf reports `<home>/S.gpg-agent`).
+    fn agent_store() -> (tempfile::TempDir, PassStore) {
+        let home = tempfile::tempdir().unwrap();
+        let store =
+            crate::test_support::store(home.path()).with_homedir(Some(home.path().to_path_buf()));
+        (home, store)
+    }
+
+    /// A key-listing snippet for the fake gpg: pass its path as the
+    /// recipient. Exits 2 like a real gpg missing one of several keys.
+    fn listing(dir: &Path, colons: &str) -> String {
+        let path = dir.join("list.sh");
+        std::fs::write(&path, format!("cat <<'EOF'\n{colons}EOF\nexit 2\n")).unwrap();
+        path.display().to_string()
+    }
+
+    /// A one-connection agent on `socket` answering each `KEYINFO <grip>`
+    /// with `reply(grip)`.
+    fn serve_agent(
+        socket: &Path,
+        reply: fn(&str) -> String,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = tokio::io::split(stream);
+            w.write_all(b"OK Pleased to meet you\n").await.unwrap();
+            let mut lines = BufReader::new(r).lines();
+            let mut seen = Vec::new();
+            while let Ok(Some(cmd)) = lines.next_line().await {
+                if cmd == "BYE" {
+                    break;
+                }
+                let grip = cmd.strip_prefix("KEYINFO ").unwrap_or_default().to_string();
+                seen.push(cmd);
+                w.write_all(reply(&grip).as_bytes()).await.unwrap();
+            }
+            seen
+        })
+    }
+
+    #[tokio::test]
+    async fn keygrips_are_listed_for_the_recipients_even_when_gpg_fails() {
+        let (home, store) = agent_store();
+        let recipient = listing(home.path(), COLONS);
+        let seen = home.path().join("seen");
+        std::fs::write(
+            home.path().join("list.sh"),
+            format!(
+                "echo \"$all\" > '{}'\ncat <<'EOF'\n{COLONS}EOF\nexit 2\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        let grips = encryption_keygrips(&store, std::slice::from_ref(&recipient))
+            .await
+            .unwrap();
+        assert_eq!(grips, vec![GRIP_B]);
+        let seen = std::fs::read_to_string(seen).unwrap();
+        assert!(
+            seen.contains(&format!(
+                "--batch --no-tty --with-colons --with-keygrip --list-secret-keys -- {recipient}"
+            )),
+            "{seen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_gpg_is_an_error_for_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PassStore::new(
+            dir.path(),
+            dir.path().join("no-gpg"),
+            crate::test_support::branding(),
+        );
+        let err = encryption_keygrips(&store, &["K".into()])
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("running gpg: "), "{err}");
+        let line = crate::agent_status(&store, &["K".into()]).await;
+        assert!(line.starts_with("unknown (running gpg: "), "{line}");
+    }
+
+    #[tokio::test]
+    async fn agent_socket_comes_from_gpgconf_unescaped() {
+        let (home, store) = agent_store();
+        assert_eq!(
+            agent_socket(&store).await.unwrap(),
+            home.path().join("S.gpg-agent")
+        );
+        std::fs::write(
+            home.path().join("gpgconf.sh"),
+            "echo /run/a%3ab/S.gpg-agent\nexit 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            agent_socket(&store).await.unwrap(),
+            PathBuf::from("/run/a:b/S.gpg-agent")
+        );
+        std::fs::write(home.path().join("gpgconf.sh"), "exit 1\n").unwrap();
+        let err = agent_socket(&store).await.unwrap_err();
+        assert!(err.contains("gpgconf --list-dirs failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn state_without_an_encryption_key_is_no_secret_key() {
+        let (home, store) = agent_store();
+        let recipient = listing(home.path(), "");
+        assert_eq!(
+            state(&store, &[recipient]).await.unwrap(),
+            AgentState::NoSecretKey
+        );
+    }
+
+    #[tokio::test]
+    async fn state_without_an_agent_is_not_running() {
+        let (home, store) = agent_store();
+        let recipient = listing(home.path(), COLONS);
+        assert_eq!(
+            state(&store, std::slice::from_ref(&recipient))
+                .await
+                .unwrap(),
+            AgentState::NotRunning
+        );
+        let line = crate::agent_status(&store, &[recipient]).await;
+        assert_eq!(
+            line,
+            "locked (gpg-agent is not running; run `test-mcp unlock`)"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_asks_the_running_agent() {
+        let (home, store) = agent_store();
+        let recipient = listing(home.path(), COLONS);
+        let agent = serve_agent(&home.path().join("S.gpg-agent"), |grip| {
+            format!("S KEYINFO {grip} D - - 1 P - - -\nOK\n")
+        });
+        let line = crate::agent_status(&store, &[recipient]).await;
+        assert_eq!(line, "unlocked (passphrase cached in gpg-agent)");
+        assert_eq!(agent.await.unwrap(), vec![format!("KEYINFO {GRIP_B}")]);
+    }
+
+    #[tokio::test]
+    async fn query_socket_reports_uncached_keys_as_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("S.gpg-agent");
+        let agent = serve_agent(&socket, |grip| {
+            if grip == GRIP_A {
+                "ERR 67108891 Not found <GPG Agent>\n".into()
+            } else {
+                format!("S KEYINFO {grip} D - - - P - - -\nOK\n")
+            }
+        });
+        let infos = query_socket(&socket, &[GRIP_A.into(), GRIP_B.into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(infos[0], None);
+        assert_eq!(summarize(&infos), AgentState::Locked);
+        assert_eq!(agent.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn greeting_error_is_surfaced() {
+        let (client, server) = tokio::io::duplex(64);
+        let (_r, mut w) = tokio::io::split(server);
+        w.write_all(b"ERR 67108865 General error\n").await.unwrap();
+        let err = keyinfo(client, &[GRIP_B.into()]).await.unwrap_err();
+        assert!(err.starts_with("agent greeting: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn agent_hanging_up_mid_reply_is_an_error() {
+        let (client, server) = tokio::io::duplex(256);
+        let agent = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(server);
+            w.write_all(b"OK hi\n").await.unwrap();
+            let mut lines = BufReader::new(r).lines();
+            lines.next_line().await.unwrap();
+            // Half a reply, then hang up.
+            w.write_all(b"S KEYINFO x D - - 1 P - - -\n").await.unwrap();
+        });
+        let err = keyinfo(client, &[GRIP_B.into()]).await.unwrap_err();
+        assert!(err.contains("closed the connection"), "{err}");
+        agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn err_without_a_numeric_code_is_an_error() {
+        let err = run_agent("ERR oops\n", &[GRIP_B]).await.unwrap_err();
+        assert!(err.contains("error code 0"), "{err}");
+    }
+
+    #[test]
+    fn smartcard_keyinfo_parses() {
+        let rest = format!("{GRIP_B} T D2760001240100000006 OPENPGP.2 - - - - -");
+        let info = parse_keyinfo(&rest).unwrap();
+        assert_eq!(info.kind, 'T');
+        assert!(!info.cached);
+        assert_eq!(summarize(&[Some(info)]), AgentState::Smartcard);
+    }
+
+    #[test]
+    fn stray_or_empty_grp_records_are_ignored() {
+        // A grp with no preceding sec/ssb, and an encryption subkey whose grp
+        // has no keygrip field.
+        let colons = format!(
+            "grp:::::::::{GRIP_A}:\n\
+             ssb:u:255:18:D8936DA9BE6E9ED2:1794667539::::::e:::+::cv25519::\n\
+             grp:::::::::\n\
+             uid:u::::::::x\n"
+        );
+        assert_eq!(
+            parse_encryption_keygrips(&colons),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            parse_encryption_keygrips(""),
+            [] as [std::string::String; 0]
+        );
+    }
+
+    #[test]
+    fn describe_covers_every_state() {
+        for state in [
+            AgentState::Unlocked,
+            AgentState::Unprotected,
+            AgentState::Locked,
+            AgentState::Smartcard,
+            AgentState::NotRunning,
+            AgentState::NoSecretKey,
+        ] {
+            let text = state.describe("x-mcp");
+            assert_ne!(text, "");
+            let advises = text.contains("`x-mcp unlock`");
+            assert_eq!(
+                advises,
+                matches!(state, AgentState::Locked | AgentState::NotRunning),
+                "{state:?}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_hanging_up_after_the_greeting_is_an_error() {
+        let (client, server) = tokio::io::duplex(64);
+        let (r, mut w) = tokio::io::split(server);
+        w.write_all(b"OK hi\n").await.unwrap();
+        drop((r, w));
+        assert!(keyinfo(client, &[GRIP_B.into()]).await.is_err());
     }
 }

@@ -469,4 +469,78 @@ mod tests {
         let debug = format!("{token:?}");
         assert!(!debug.contains("old-secret"), "{debug}");
     }
+
+    #[tokio::test]
+    async fn rejection_before_any_read_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, token) = token(dir.path());
+        std::fs::write(&file, ok_snippet(OLD)).unwrap();
+        token.mark_rejected(&hv(OLD)).await;
+        let counter = dir.path().join("decrypts");
+        std::fs::write(&file, counting(&counter, &ok_snippet(OLD))).unwrap();
+        assert_eq!(token.value().await.unwrap(), hv(OLD));
+        assert_eq!(token.value().await.unwrap(), hv(OLD));
+        assert_eq!(runs(&counter), 1);
+    }
+
+    #[tokio::test]
+    async fn rotated_token_that_is_not_a_header_value_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, token) = token(dir.path());
+        std::fs::write(&file, ok_snippet(OLD)).unwrap();
+        let sent = token.value().await.unwrap();
+        std::fs::write(&file, ok_snippet("bad\u{1}token")).unwrap();
+        let err = token
+            .retry_value(StatusCode::UNAUTHORIZED, &sent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TokenError::InvalidHeader { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn backoff_holds_then_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, token) = token(dir.path());
+        let token = token.with_backoff(Duration::from_millis(300));
+        std::fs::write(&file, ok_snippet(OLD)).unwrap();
+        let sent = token.value().await.unwrap();
+        let counter = dir.path().join("decrypts");
+        std::fs::write(&file, counting(&counter, LOCKED_SNIPPET)).unwrap();
+
+        token.mark_rejected(&sent).await;
+        assert_eq!(token.value().await.unwrap(), sent);
+        assert_eq!(runs(&counter), 1);
+        // Inside the window: the old token, no gpg run.
+        assert_eq!(token.value().await.unwrap(), sent);
+        assert_eq!(runs(&counter), 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Window over and still stale: re-read (fails again, old token kept).
+        assert_eq!(token.value().await.unwrap(), sent);
+        assert_eq!(runs(&counter), 2);
+    }
+
+    #[tokio::test]
+    async fn default_backoff_and_accessors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_file, token) = token(dir.path());
+        assert_eq!(REREAD_BACKOFF, Duration::from_secs(30));
+        assert_eq!(token.header_name(), AUTHORIZATION);
+        assert_eq!(token.entry().name(), "t");
+        let debug = format!("{token:?}");
+        assert!(debug.contains("backoff: 30s"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn pass_errors_pass_through_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, token) = token(dir.path());
+        let missing = token.value().await.unwrap_err();
+        assert!(matches!(
+            missing,
+            TokenError::Pass(PassError::NotFound { .. })
+        ));
+        let direct = token.entry().read_token().await.unwrap_err();
+        assert_eq!(missing.to_string(), direct.to_string());
+        drop(file);
+    }
 }

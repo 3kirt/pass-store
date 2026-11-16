@@ -1,14 +1,25 @@
-//! A fake `gpg` for tests (cargo feature `test-support`).
+//! A fake `gpg` and `gpgconf` for tests (cargo feature `test-support`).
 //!
-//! One shared script, written once, so no test ever executes a file another
-//! thread is still writing (the ETXTBSY race).
-//! - Decrypt mode *sources* the entry file, so each test's "ciphertext" is a
-//!   shell snippet producing the canned stdout, `[GNUPG:]` status lines and
-//!   exit code it wants (see [`ok_snippet`], [`LOCKED_SNIPPET`]). The
-//!   snippet can read the space-joined argv from `$all`.
-//! - Encrypt mode copies stdin to `--output` and records its arguments next
-//!   to it in `<output>.args`. A recipient named `NOPUBKEY` makes it exit
-//!   like a real gpg with no public key: an error, without reading stdin.
+//! Each is one shared script, written once, so no test ever executes a file
+//! another thread is still writing (the ETXTBSY race).
+//!
+//! [`fake_gpg`]:
+//! - Encrypt mode (`--encrypt`) copies stdin to `--output` and records its
+//!   arguments next to it in `<output>.args`. A recipient named `NOPUBKEY`
+//!   makes it exit like a real gpg with no public key: an error, without
+//!   reading stdin. A recipient named `HANG` makes it hang (for timeouts).
+//! - Every other invocation (`--decrypt`, `--list-secret-keys`, …) *sources*
+//!   its last argument. For a decrypt that's the entry file, so each test's
+//!   "ciphertext" is a shell snippet producing the canned stdout,
+//!   `[GNUPG:]` status lines and exit code it wants (see [`ok_snippet`],
+//!   [`LOCKED_SNIPPET`]). For a key listing it's the last recipient, so
+//!   pass a snippet's path as the recipient. A snippet can read the
+//!   space-joined argv from `$all`.
+//!
+//! The matching `gpgconf` sits next to it, so a store using the fake gpg
+//! runs it (see [`crate::PassStore::gpgconf`]). It needs the store's
+//! `--homedir H`: it sources `H/gpgconf.sh` when that exists, and otherwise
+//! answers `--list-dirs agent-socket` with `H/S.gpg-agent`.
 //!
 //! In a snippet that can outlive its test's timeout, use `exec sleep 10`, not
 //! a plain `sleep`: killing the fake must kill the sleep too, or on macOS
@@ -38,12 +49,37 @@ if [ "$mode" = encrypt ]; then
       # Like a real gpg with no public key: exit without reading stdin.
       echo "gpg: NOPUBKEY: skipped: No public key" >&2
       exit 2 ;;
+    *" HANG"*)
+      exec sleep 10 ;;
   esac
   cat > "$out"
   echo "$all" > "$out.args"
   exit 0
 fi
 . "$last"
+"#;
+
+const FAKE_GPGCONF: &str = r#"#!/bin/sh
+home=
+all=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --homedir) shift; home="$1" ;;
+  esac
+  all="$all $1"
+  shift
+done
+if [ -z "$home" ]; then
+  echo "fake gpgconf: needs --homedir" >&2
+  exit 1
+fi
+if [ -f "$home/gpgconf.sh" ]; then
+  . "$home/gpgconf.sh"
+fi
+case "$all" in
+  *" --list-dirs agent-socket"*) echo "$home/S.gpg-agent" ;;
+esac
+exit 0
 "#;
 
 /// The fake gpg's path. Pass it as the store's gpg program.
@@ -55,16 +91,22 @@ pub fn fake_gpg() -> &'static Path {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let dir = tempfile::tempdir().expect("tempdir").keep();
+        // gpgconf first: by the time anyone has the gpg path, both exist.
+        write_script(&dir.join("gpgconf"), FAKE_GPGCONF);
         let path = dir.join("gpg");
-        std::fs::write(&path, FAKE_GPG).expect("write fake gpg");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake gpg");
-        }
+        write_script(&path, FAKE_GPG);
         path
     })
+}
+
+fn write_script(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("write fake script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake script");
+    }
 }
 
 /// A decrypt that prints `plaintext` (quoted, so any text is safe) with the

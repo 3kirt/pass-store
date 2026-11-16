@@ -29,6 +29,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: actionlint,shellcheck
+      # Secrets scan, clippy over every feature set, fmt, rustdoc, and
+      # actionlint/shellcheck over the workflows and scripts.
       - run: make lint
 
   test:
@@ -45,14 +50,60 @@ jobs:
       - run: make test
 
   real-gpg:
-    name: Real gpg
-    runs-on: ubuntu-latest
+    name: Real gpg (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install GnuPG (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gnupg
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: gpg --version
       - run: make test-real-gpg
+
+  windows:
+    name: Non-Unix build
+    # Compiles (and lints) the cfg(not(unix)) paths the apps' Windows
+    # builds would take. The suite itself drives a POSIX-shell fake gpg.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: make check-windows
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-llvm-cov
+      # Unit, integration and real-gpg tests; fails below COVERAGE_MIN.
+      - run: make coverage
+
+  minimal-versions:
+    name: Minimal versions
+    # Cargo.toml's lower bounds: an app whose lockfile pins an older
+    # dependency builds against these.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install nightly --profile minimal
+      - name: Install the rust-version toolchain
+        run: rustup toolchain install "$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: make minimal-versions
 
   deny:
     name: cargo-deny

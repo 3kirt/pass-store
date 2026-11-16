@@ -13,15 +13,18 @@ not in an app.
 ## Commands
 
 ```sh
-make check          # pre-release gate: fmt-check lint test deny package
-make build          # cargo build --all-features
-make test           # cargo test, default and --all-features
-make lint           # secrets-scan + clippy --all-targets (each feature set) -D warnings + fmt --check
-make fmt            # cargo fmt
-make deny           # cargo deny check (advisories, bans, sources, licenses)
-make msrv           # cargo +<rust-version> test --all-features
-make package        # cargo package (PACKAGE_FLAGS=--allow-dirty before committing)
-make test-real-gpg  # REAL_GPG=1: classification against the real gpg (makes throwaway keys)
+make check            # pre-release gate: fmt-check lint test deny package
+make build            # cargo build --all-features
+make test             # scripts/test-changelog.sh, then cargo test once per feature set
+make lint             # secrets-scan, clippy (each feature set), fmt --check, rustdoc -D warnings, actionlint + shellcheck
+make fmt              # cargo fmt
+make deny             # cargo deny check (advisories, bans, sources, licenses)
+make msrv             # cargo +<rust-version> test --all-features
+make minimal-versions # direct deps at Cargo.toml's lower bounds (nightly resolve), suite on the MSRV
+make check-windows    # clippy for x86_64-pc-windows-msvc: the cfg(not(unix)) paths
+make coverage         # cargo llvm-cov incl. real gpg; fails under COVERAGE_MIN (97%) lines
+make package          # cargo package (PACKAGE_FLAGS=--allow-dirty before committing)
+make test-real-gpg    # REAL_GPG=1: classification against the real gpg (makes throwaway keys)
 
 cargo test <test_name>   # run a single test
 ```
@@ -31,8 +34,9 @@ clean before every commit: `make fmt`, then `make lint`.
 
 **CI/CD** (the same shape as the three apps): the Makefile is the single source of
 truth, and the workflows only call its targets.
-- `ci.yml` runs lint, test on ubuntu and macos, real-gpg, deny and package,
-  plus msrv except on PRs. `release.yml` calls it as a gate.
+- `ci.yml` runs lint, test and real-gpg on ubuntu and macos, deny, package,
+  the non-Unix build, coverage and minimal-versions, plus msrv except on
+  PRs. `release.yml` calls it as a gate.
 - `release.yml` runs on a `v*` tag. It runs verify (tag == Cargo.toml version,
   the tag is on main, the CHANGELOG has a section), then CI, then
   `cargo publish` (secret `CARGO_REGISTRY_TOKEN`), then a GitHub release with
@@ -57,6 +61,28 @@ commented allow-list (`multiple_crate_versions`, `doc_markdown`,
 `redundant_feature_names`). New warnings must be fixed, not silenced, unless
 they belong in that list. Public fallible functions document `# Errors`.
 
+## Tests
+
+Every invariant below has a unit test; a fix comes with a regression test.
+- **Unit tests** live next to the code: `cargo test <name>` runs one.
+- **`tests/public_api.rs`** uses only public items, with the `http` and
+  `test-support` features (`required-features` in Cargo.toml), as an app
+  would. A new public item gets a line there.
+- **The README's Rust example** compiles as a doctest (`ReadmeDoctests` in
+  lib.rs).
+- **`scripts/test-changelog.sh`** tests `changelog-section.sh` and
+  CHANGELOG.md's heading shape.
+- **Coverage** is measured with the real-gpg test included. Raise
+  `COVERAGE_MIN` in the Makefile when coverage rises; don't lower it to
+  get a change through.
+- **Lower bounds:** when code starts using a newer dependency API, raise
+  that dependency's lower bound in Cargo.toml; `make minimal-versions`
+  catches it.
+- **Never write an executable at test time.** Use the shared fake
+  gpg/gpgconf: writing and then executing a script races with other tests'
+  spawns (ETXTBSY on Linux). On macOS a just-closed fd or listener can also
+  leak briefly into another test's child process.
+
 ## Layout
 
 ```
@@ -68,6 +94,8 @@ src/
   token.rs        — (feature http) LazyToken
   test_support.rs — (test or feature test-support) fake gpg, snippets, lock_env
   real_gpg.rs     — (#[ignore], REAL_GPG=1) the real-gpg classification test
+tests/public_api.rs — the public API as an app uses it
+scripts/        — changelog-section.sh (release notes) and its test
 ```
 
 ## Branding
@@ -138,8 +166,12 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
 
 **Tests**
 - The fake gpg (`test_support`) is one script written once, which avoids
-  ETXTBSY races. Decrypt mode *sources* the entry file; encrypt mode records
-  argv in `<output>.args`; a `NOPUBKEY` recipient exits without reading stdin.
+  ETXTBSY races. Decrypt and key-listing modes *source* their last argument
+  (the entry file, or a snippet passed as the recipient); encrypt mode
+  records argv in `<output>.args`; a `NOPUBKEY` recipient exits without
+  reading stdin, and `HANG` hangs. The fake gpgconf next to it answers
+  `--list-dirs agent-socket` with `<homedir>/S.gpg-agent` or sources
+  `<homedir>/gpgconf.sh`.
 - A snippet that outlives its timeout must use `exec sleep 10`, not plain
   `sleep`: on macOS an orphaned child can hold another test's pipe open for
   10s.

@@ -706,17 +706,18 @@ pub fn create_private_dir(dir: &Path) -> Result<(), PassError> {
     builder.create(dir).map_err(|e| io_err("creating", dir, &e))
 }
 
-/// Owner-only (0600) on Unix, whatever gpg's `--output` left behind.
-#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+/// Owner-only (0600), whatever gpg's `--output` left behind.
+#[cfg(unix)]
 fn restrict(path: &Path) -> Result<(), PassError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| io_err("restricting", path, &e))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| io_err("restricting", path, &e))
+}
+
+/// Unix permissions don't apply elsewhere.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // same signature as the Unix version
+const fn restrict(_: &Path) -> Result<(), PassError> {
     Ok(())
 }
 
@@ -1125,26 +1126,17 @@ mod tests {
     #[tokio::test]
     async fn hung_encrypt_times_out_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
-        let gpg = dir.path().join("hung-gpg");
-        std::fs::write(&gpg, "#!/bin/sh\nexec sleep 10\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let store = PassStore::new(dir.path().join("store"), &gpg, branding())
-            .with_timeout(Duration::from_millis(200));
+        let store = store(dir.path()).with_timeout(Duration::from_millis(200));
         let entry = store.entry("t").unwrap();
+        let start = std::time::Instant::now();
         // Bigger than a pipe buffer: the stdin write itself must be bounded.
         let err = entry
-            .write_token(&"x".repeat(1 << 20), &["K1".into()])
+            .write_token(&"x".repeat(1 << 20), &["HANG".into()])
             .await
             .unwrap_err();
         assert!(matches!(err, PassError::Timeout { .. }), "{err}");
-        assert_eq!(
-            std::fs::read_dir(dir.path().join("store")).unwrap().count(),
-            0
-        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -1364,5 +1356,376 @@ mod tests {
             PassStore::new("/s", "gpg", branding()).gpgconf(),
             PathBuf::from("gpgconf")
         );
+    }
+
+    /// Entry names under `dir`, minus the fake's `.args` records.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| Path::new(n).extension().is_none_or(|e| e != "args"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn unlock_interactive_uses_the_normal_pinentry() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = store(dir.path()).entry("t").unwrap();
+        let seen = dir.path().join("seen");
+        std::fs::write(
+            entry.path(),
+            format!("echo \"$all\" > '{}'\nexit 0\n", seen.display()),
+        )
+        .unwrap();
+        entry.unlock_interactive().await.unwrap();
+        let seen = std::fs::read_to_string(seen).unwrap();
+        assert!(seen.contains(" --quiet --decrypt -- "), "{seen}");
+        // Interactive on purpose: a pinentry may prompt here.
+        assert!(!seen.contains("--pinentry-mode"), "{seen}");
+        assert!(!seen.contains("--batch"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn unlock_interactive_failure_suggests_gpg_tty() {
+        let (_dir, entry) = store_with("t", "exit 2\n");
+        let msg = entry.unlock_interactive().await.unwrap_err().to_string();
+        assert!(msg.contains("GPG_TTY"), "{msg}");
+        assert!(msg.contains(&entry.path().display().to_string()), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn non_utf8_plaintext_is_rejected() {
+        let snippet = "printf '\\377\\376\\n'\necho '[GNUPG:] DECRYPTION_OKAY' >&2\nexit 0\n";
+        let (_dir, entry) = store_with("t", snippet);
+        let msg = entry.read_token().await.unwrap_err().to_string();
+        assert!(msg.contains("UTF-8"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn timeout_message_names_the_entry_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_timeout(Duration::from_secs(1));
+        let entry = store.entry("t").unwrap();
+        std::fs::write(entry.path(), "exec sleep 10\n").unwrap();
+        let msg = entry.read_token().await.unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            format!(
+                "gpg did not finish decrypting {} within 1s",
+                entry.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn error_messages() {
+        let path = PathBuf::from("/s/t.gpg");
+        assert_eq!(
+            PassError::NoSecretKey { path: path.clone() }.to_string(),
+            "no secret key in this GnuPG keyring can decrypt /s/t.gpg"
+        );
+        assert_eq!(
+            PassError::NotFound {
+                product: "NetBox".into(),
+                entry: "t".into(),
+                path,
+                cli: "netbox-mcp".into(),
+            }
+            .to_string(),
+            "no NetBox token stored at pass entry 't' (/s/t.gpg does not exist); \
+             run `netbox-mcp login` to store one"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_token_replaces_an_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = store(dir.path()).entry("t").unwrap();
+        entry.write_token("tok-old", &["K1".into()]).await.unwrap();
+        entry.write_token("tok-new", &["K1".into()]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(entry.path()).unwrap(), "tok-new\n");
+        assert_eq!(names(dir.path()), vec!["t.gpg"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_token_creates_every_new_directory_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let entry = PassStore::new(&root, fake_gpg(), branding())
+            .entry("a/b/c")
+            .unwrap();
+        entry.write_token("tok", &["K1".into()]).await.unwrap();
+        for d in [root.clone(), root.join("a"), root.join("a/b")] {
+            assert_eq!(mode(&d), 0o700, "{}", d.display());
+        }
+        assert_eq!(mode(&entry.path()), 0o600);
+    }
+
+    #[tokio::test]
+    async fn write_token_with_a_missing_gpg_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PassStore::new(dir.path(), dir.path().join("no-such-gpg"), branding());
+        let entry = store.entry("t").unwrap();
+        let msg = entry
+            .write_token("tok", &["K1".into()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_executable_gpg_is_a_spawn_error_not_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpg = dir.path().join("gpg");
+        // Never executable, so no ETXTBSY race with concurrently spawned tests.
+        std::fs::write(&gpg, "").unwrap();
+        let store = PassStore::new(dir.path(), &gpg, branding());
+        let entry = store.entry("t").unwrap();
+        std::fs::write(entry.path(), "").unwrap();
+        let msg = entry.read_token().await.unwrap_err().to_string();
+        assert!(
+            msg.starts_with(&format!("running {}: ", gpg.display())),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_creates_a_private_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        PassStore::new(&root, "gpg", branding())
+            .init(" ABCD ")
+            .unwrap();
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join(".gpg-id")), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gpg-id")).unwrap(),
+            "ABCD\n"
+        );
+    }
+
+    #[test]
+    fn create_private_file_never_reuses_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        drop(create_private_file(&path).unwrap());
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+        let err = create_private_file(&path).unwrap_err().to_string();
+        assert!(err.starts_with("creating "), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_is_owner_only_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("x/y");
+        create_private_dir(&d).unwrap();
+        create_private_dir(&d).unwrap();
+        assert_eq!(mode(&d), 0o700);
+        assert_eq!(mode(&dir.path().join("x")), 0o700);
+    }
+
+    #[test]
+    fn gpg_decrypt_command_quotes_every_part() {
+        let store = PassStore::new("/s", "/opt/my gpg/gpg", branding())
+            .with_homedir(Some(PathBuf::from("/k/it's")));
+        assert_eq!(
+            store.gpg_decrypt_command(Path::new("/s/a b.gpg")),
+            r"'/opt/my gpg/gpg' --homedir '/k/it'\''s' --decrypt '/s/a b.gpg'"
+        );
+        assert_eq!(
+            PassStore::new("/s", "gpg", branding()).gpg_decrypt_command(Path::new("/s/t.gpg")),
+            "gpg --decrypt /s/t.gpg"
+        );
+    }
+
+    #[test]
+    fn malformed_status_lines_never_classify() {
+        for stderr in [
+            "[GNUPG:] ERROR pkdecrypt_failed\n",
+            "[GNUPG:] ERROR pkdecrypt_failed locked\n",
+            "[GNUPG:] ERROR\n",
+            "[GNUPG:]ERROR pkdecrypt_failed 67108949\n",
+            "gpg: [GNUPG:] ERROR pkdecrypt_failed 67108949\n",
+            "[GNUPG:] ERROR pkdecrypt_failed -85\n",
+        ] {
+            assert_eq!(
+                classify_decrypt(false, stderr),
+                DecryptOutcome::Failed,
+                "{stderr:?}"
+            );
+        }
+        // Other codes, even sharing high bits with a known one, don't count.
+        assert_eq!(
+            classify_decrypt(false, "[GNUPG:] ERROR x 67108950\n"),
+            DecryptOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn recipients_skip_a_gpg_id_that_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PassStore::new(dir.path(), "gpg", branding());
+        std::fs::write(dir.path().join(".gpg-id"), "ROOT\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("a/.gpg-id")).unwrap();
+        let entry = store.entry("a/tok").unwrap();
+        assert_eq!(entry.recipients().unwrap().unwrap(), vec!["ROOT"]);
+        // A top-level entry reads the root .gpg-id directly.
+        assert_eq!(
+            store.entry("tok").unwrap().recipients().unwrap().unwrap(),
+            vec!["ROOT"]
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_home_needs_explicit_paths() {
+        let _guard = lock_env();
+        let saved: Vec<_> = ["HOME", "USERPROFILE", "PASSWORD_STORE_DIR"]
+            .iter()
+            .map(|v| (*v, std::env::var_os(v)))
+            .collect();
+        // SAFETY: lock_env() serializes every env access in this crate's tests.
+        unsafe {
+            for (v, _) in &saved {
+                std::env::remove_var(v);
+            }
+        }
+        let default = PassStore::resolve(&StoreLocation::default(), branding());
+        let tilde = PassStore::resolve(
+            &StoreLocation {
+                store_dir: Some("~/store"),
+                ..StoreLocation::default()
+            },
+            branding(),
+        );
+        let explicit = PassStore::resolve(
+            &StoreLocation {
+                store_dir: Some("/stores/pass"),
+                ..StoreLocation::default()
+            },
+            branding(),
+        );
+        // SAFETY: as above.
+        unsafe {
+            for (v, val) in &saved {
+                if let Some(val) = val {
+                    std::env::set_var(v, val);
+                }
+            }
+        }
+        let msg = default.unwrap_err().to_string();
+        assert!(msg.contains("home directory"), "{msg}");
+        assert!(tilde.is_err());
+        assert_eq!(explicit.unwrap().root(), Path::new("/stores/pass"));
+    }
+
+    #[test]
+    fn password_store_dir_env_expands_tilde() {
+        let _guard = lock_env();
+        // SAFETY: lock_env() serializes every env access in this crate's tests.
+        unsafe { std::env::set_var("PASSWORD_STORE_DIR", "~/env-store") };
+        let resolved = PassStore::resolve(&StoreLocation::default(), branding());
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("PASSWORD_STORE_DIR") };
+        assert_eq!(
+            resolved.unwrap().root(),
+            crate::env::home_dir().unwrap().join("env-store")
+        );
+    }
+
+    #[test]
+    fn accessors_report_what_was_configured() {
+        let store = PassStore::new("/s", "/bin/gpg", Branding::new("P", "p-mcp"));
+        assert_eq!(store.cli(), "p-mcp");
+        assert_eq!(store.branding().product(), "P");
+        assert_eq!(store.gpg(), Path::new("/bin/gpg"));
+        assert_eq!(store.homedir(), None);
+        let entry = store.entry("a/b").unwrap();
+        assert_eq!(entry.name(), "a/b");
+        assert_eq!(entry.path(), Path::new("/s/a/b.gpg"));
+        assert_eq!(entry.store().root(), Path::new("/s"));
+    }
+
+    #[test]
+    fn gpg_and_gpgconf_commands_carry_the_homedir() {
+        let store = PassStore::new("/s", "/opt/bin/gpg", branding())
+            .with_homedir(Some(PathBuf::from("/k")));
+        for (cmd, program) in [
+            (store.gpg_command(), "/opt/bin/gpg"),
+            (store.gpgconf_command(), "/opt/bin/gpgconf"),
+        ] {
+            let cmd = cmd.as_std();
+            assert_eq!(cmd.get_program(), program);
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args, ["--homedir", "/k"]);
+        }
+        let bare = PassStore::new("/s", "gpg", branding());
+        assert_eq!(bare.gpg_command().as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn remove_reports_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = store(dir.path()).entry("t").unwrap();
+        // A directory where the entry file should be.
+        std::fs::create_dir(entry.path()).unwrap();
+        let err = entry.remove().unwrap_err();
+        assert!(matches!(err, PassError::Other(_)), "{err}");
+        assert!(err.to_string().starts_with("removing "), "{err}");
+    }
+
+    #[test]
+    fn unreadable_gpg_id_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gpg-id"), b"\xff\xfe\n").unwrap();
+        let entry = store(dir.path()).entry("t").unwrap();
+        let err = entry.recipients().unwrap_err().to_string();
+        assert!(err.starts_with("reading "), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsearchable_store_is_an_error_not_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let entry = store(&locked).entry("a/t").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = entry.read_token().await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root ignores permissions, so this only means something otherwise.
+        if !matches!(result, Err(PassError::NotFound { .. })) {
+            let err = result.unwrap_err().to_string();
+            assert!(err.starts_with("checking "), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unlock_with_a_missing_gpg_names_the_config_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PassStore::new(dir.path(), dir.path().join("no-such-gpg"), branding());
+        let msg = store
+            .entry("t")
+            .unwrap()
+            .unlock_interactive()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("\"gpg\""), "{msg}");
     }
 }

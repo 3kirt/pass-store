@@ -32,6 +32,11 @@ pub mod test_support;
 #[cfg(feature = "http")]
 mod token;
 
+// Compiles the README's Rust example as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub use env::{env_var, home_dir, is_unexpanded_placeholder, non_blank};
 pub use store::{
     Branding, GPG_TIMEOUT, PassEntry, PassError, PassStore, StoreLocation, create_private_dir,
@@ -45,6 +50,8 @@ pub use token::{LazyToken, REREAD_BACKOFF, TokenError};
 ///
 /// Never fails: an error becomes "unknown (…)", and on non-Unix platforms,
 /// where the agent query isn't supported, it says so.
+// Async on every platform, so callers don't need their own `cfg`.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 pub async fn agent_status(store: &PassStore, recipients: &[String]) -> String {
     #[cfg(unix)]
     {

@@ -161,4 +161,112 @@ mod tests {
         assert_eq!(expand_tilde("/abs").unwrap(), PathBuf::from("/abs"));
         assert_eq!(expand_tilde("a/~/b").unwrap(), PathBuf::from("a/~/b"));
     }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn unset_values() {
+        for v in ["", " ", "\t\n", "${X}", " ${X:-y} "] {
+            assert!(is_unset_value(v), "{v:?}");
+        }
+        for v in ["x", " x ", "${X} y", "$X"] {
+            assert!(!is_unset_value(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn home_dir_falls_back_to_userprofile_and_ignores_empty() {
+        let _guard = lock_env();
+        let saved = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        // SAFETY: lock_env() serializes every env access in this crate's tests.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("USERPROFILE", "/profile");
+        }
+        let fallback = home_dir();
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("HOME", "");
+            std::env::remove_var("USERPROFILE");
+        }
+        let empty = home_dir();
+        let tilde = expand_tilde("~/x");
+        let plain = expand_tilde("/abs");
+        // SAFETY: as above.
+        unsafe {
+            match &saved.0 {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(p) = &saved.1 {
+                std::env::set_var("USERPROFILE", p);
+            }
+        }
+        assert_eq!(fallback.unwrap(), PathBuf::from("/profile"));
+        assert_eq!(empty.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(tilde.is_err());
+        // A path without `~` never needs the home directory.
+        assert_eq!(plain.unwrap(), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn only_a_leading_tilde_slash_expands() {
+        let _guard = lock_env();
+        // `~user` is shell syntax this crate doesn't resolve: taken literally.
+        assert_eq!(expand_tilde("~user/x").unwrap(), PathBuf::from("~user/x"));
+        assert_eq!(expand_tilde("./~").unwrap(), PathBuf::from("./~"));
+    }
+
+    /// Counts WARN events naming a `variable` field.
+    #[derive(Default)]
+    struct Warnings(std::sync::Mutex<Vec<String>>);
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Var(Option<String>);
+            impl tracing::field::Visit for Var {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "variable" {
+                        self.0 = Some(value.to_string());
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut var = Var(None);
+                event.record(&mut var);
+                if let Some(v) = var.0 {
+                    self.0.lock().unwrap().push(v);
+                }
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn a_placeholder_warns_but_a_blank_does_not() {
+        const VAR: &str = "PASS_STORE_TEST_WARN_VAR";
+        let _guard = lock_env();
+        let warnings = std::sync::Arc::new(Warnings::default());
+        let read = |raw: &str| {
+            // SAFETY: lock_env() serializes every env access in this crate's tests.
+            unsafe { std::env::set_var(VAR, raw) };
+            tracing::subscriber::with_default(warnings.clone(), || env_var(VAR))
+        };
+        assert_eq!(read("${PASS_STORE_TEST_WARN_VAR}"), None);
+        assert_eq!(read("   "), None);
+        assert_eq!(read("set"), Some("set".into()));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(*warnings.0.lock().unwrap(), vec![VAR.to_string()]);
+    }
 }

@@ -89,14 +89,17 @@ Moving to crates.io later only means dropping `git` and `rev`.
 | Feature        | What it adds |
 |----------------|--------------|
 | `http`         | `LazyToken`: an HTTP auth header decrypted on first use (one gpg run for concurrent callers). It is re-read when the server rejects it, so the first request after `login` rotates the token can retry once, and it backs off for 30s when that re-read fails. Depends only on `http = "1"`. |
-| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), plus `lock_env()` for tests that touch the environment. |
+| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with a matching fake gpgconf for `status` tests, plus `lock_env()` for tests that touch the environment. |
 
 ## Development
 
 ```sh
-make check          # fmt-check, lint, test, deny, package (the pre-release gate)
-make msrv           # the test suite on rust-version (1.88)
-make test-real-gpg  # classification against the real gpg (throwaway keys)
+make check            # fmt-check, lint, test, deny, package (the pre-release gate)
+make msrv             # the test suite on rust-version (1.88)
+make test-real-gpg    # classification against the real gpg (throwaway keys)
+make coverage         # line coverage, real gpg included (needs cargo-llvm-cov)
+make minimal-versions # the suite with Cargo.toml's lowest allowed dependencies
+make check-windows    # the non-Unix code paths compile and lint clean
 ```
 
 See [CLAUDE.md](CLAUDE.md) for the invariants the apps rely on.

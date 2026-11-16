@@ -34,16 +34,25 @@ doc_markdown = "allow"
 redundant_feature_names = "allow"
 
 [dependencies]
-percent-encoding = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "net", "process", "time"] }
-tracing = "0.1"
+tokio = { version = "1.26", features = ["fs", "io-util", "net", "process", "time"] }
+tracing = "0.1.6"
 http = { version = "1", optional = true }
-tempfile = { version = "3", optional = true }
+tempfile = { version = "3.20", optional = true }
+
+# gpgconf's escaped socket path, for the Unix-only agent client.
+[target.'cfg(unix)'.dependencies]
+percent-encoding = "2"
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+http = "1"
+tempfile = "3.20"
+tokio = { version = "1.26", features = ["macros", "rt-multi-thread", "sync"] }
+
+# The public API as the apps use it.
+[[test]]
+name = "public_api"
+required-features = ["http", "test-support"]
 
 [package.metadata.docs.rs]
 all-features = true
