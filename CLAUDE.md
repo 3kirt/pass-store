@@ -102,13 +102,15 @@ Every invariant below has a unit test; a fix comes with a regression test.
 - A snippet that outlives its timeout must use `exec sleep 10`, not plain
   `sleep`: on macOS an orphaned child can hold another test's pipe open for
   10s.
-- **The environment:** change it only through `test_support::EnvGuard`,
-  which holds `lock_env()` and restores every variable on drop, panics
-  included. Hold `lock_env()` around anything that only reads it (e.g.
-  resolving a store). The apps must use this same lock as their only
-  environment lock, and the README's "Testing an app that uses it" says so.
-  proxmox-mcp's migration showed a separate app lock races with pass-store's
-  reads.
+- **The environment:** `PassStore::resolve` takes a `StoreEnv` and reads
+  nothing from the process, so its tests build one: no lock, no `set_var`.
+  Only `StoreEnv::from_process`, `env_var`, `home_dir` and `expand_tilde`
+  read the process environment. Their tests change it only through
+  `test_support::EnvGuard`, which holds `lock_env()` and restores every
+  variable on drop, panics included. The apps must use this same lock as
+  their only environment lock; proxmox-mcp's migration showed a separate app
+  lock races with pass-store's reads. The README's "Testing an app that
+  uses it" says so.
 - **`real_gpg.rs`** generates a passphrase-less key, a protected key and a
   foreign key in a short GNUPGHOME from TMPDIR (prefix `psg`: macOS limits
   socket paths to 104 bytes). It runs `gpgconf --reload` after keygen and
@@ -120,8 +122,8 @@ Every invariant below has a unit test; a fix comes with a regression test.
 ```
 src/
   lib.rs          — re-exports; agent_status() (one status line, any platform)
-  store.rs        — Branding, PassStore, PassEntry, PassError, StoreLocation, read/write/recipients, helpers
-  env.rs          — env_var / non_blank / is_unset_value / is_unexpanded_placeholder / home_dir / expand_tilde
+  store.rs        — Branding, PassStore, PassEntry, PassError, StoreLocation, StoreEnv, read/write/recipients, helpers
+  env.rs          — env_var / non_blank / is_unset_value / is_unexpanded_placeholder / home_dir / expand_tilde(_in)
   agent.rs        — (unix) gpg-agent Assuan KEYINFO client, used only by `status`
   token.rs        — (feature http) LazyToken
   test_support.rs — (test or feature test-support) fake gpg and gpgconf, snippets, EnvGuard, lock_env
@@ -165,10 +167,12 @@ decrypts P. Ask the user to unlock it by running `{cli} unlock` (or
 - Recipients come from the nearest ancestor `.gpg-id`, stopping at the store
   root, with everything after `#` stripped.
 - `init` never overwrites a root `.gpg-id`.
-- `resolve` expands `~/` (in configured values and in `$PASSWORD_STORE_DIR` /
-  `$GNUPGHOME`) and makes the root and homedir absolute
-  (`std::path::absolute`). Blank or `${…}` placeholder env vars count as
-  unset.
+- `resolve(&StoreLocation, &StoreEnv, Branding)` reads nothing from the
+  process environment; `StoreEnv::from_process()` is the one snapshot. It
+  expands `~/` against `StoreEnv::home` (in configured values and in the
+  env's `password_store_dir` / `gnupg_home`) and makes the root and homedir
+  absolute (`std::path::absolute`). `from_process` treats blank or `${…}`
+  placeholder values as unset.
 - gpgconf comes from the same directory as an explicitly configured gpg.
 
 **write_token**

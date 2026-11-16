@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `PassStore::resolve` takes the environment it falls back to
+  as a new `&StoreEnv` argument: `resolve(&loc, &env, branding)`. It no
+  longer reads `HOME`, `PASSWORD_STORE_DIR` or `GNUPGHOME` itself, so
+  resolving never races with a test that changes the environment. In
+  production, pass `&StoreEnv::from_process()` (a snapshot with today's
+  blank and `${VAR}` rules); in tests, build a `StoreEnv` directly.
+
+### Added
+- `StoreEnv` and `StoreEnv::from_process`.
+- `expand_tilde_in(path, home)`: `~/` expansion against a given home
+  directory, without reading the environment.
+
 ### Documentation
 - `test_support::lock_env`, `EnvGuard` and the README ("Testing an app that
   uses it") say that an app must use pass-store's `lock_env()` as its only

@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::env::{env_var, expand_tilde, home_dir};
+use crate::env::{env_var, expand_tilde_in, home_dir};
 
 /// How long a non-interactive decrypt (or an encrypt) may take. With
 /// `--pinentry-mode error` gpg never waits on a human, so this only bounds a
@@ -128,7 +128,7 @@ pub struct PassStore {
 
 /// Where the store and keyring live, as configured.
 ///
-/// Each `None` falls back to the process environment, then the default. The
+/// Each `None` falls back to the environment ([`StoreEnv`]), then the default. The
 /// config values exist because MCP clients launched from a GUI (e.g. from
 /// the macOS Dock) don't inherit shell-only `PASSWORD_STORE_DIR` /
 /// `GNUPGHOME` exports; `login` records what it used so the server reads the
@@ -145,41 +145,80 @@ pub struct StoreLocation<'a> {
     pub gnupg_home: Option<&'a str>,
 }
 
+/// The environment values [`PassStore::resolve`] falls back to, passed in
+/// rather than read from the process, so resolving never races with a test
+/// that changes the environment.
+///
+/// Production code takes a snapshot with [`StoreEnv::from_process`]; tests
+/// build one directly:
+///
+/// ```
+/// # use pass_store::StoreEnv;
+/// let env = StoreEnv {
+///     home: Some("/home/me".into()),
+///     ..StoreEnv::default()
+/// };
+/// ```
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StoreEnv {
+    /// The home directory, for `~/` and the default `~/.password-store`.
+    pub home: Option<PathBuf>,
+    /// `$PASSWORD_STORE_DIR`.
+    pub password_store_dir: Option<String>,
+    /// `$GNUPGHOME`.
+    pub gnupg_home: Option<String>,
+}
+
+impl StoreEnv {
+    /// A snapshot of this process's `HOME` (else `USERPROFILE`),
+    /// `PASSWORD_STORE_DIR` and `GNUPGHOME`, with blank values and
+    /// unexpanded `${…}` placeholders counting as unset (see
+    /// [`crate::env_var`]).
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            home: home_dir().ok(),
+            password_store_dir: env_var("PASSWORD_STORE_DIR"),
+            gnupg_home: env_var("GNUPGHOME"),
+        }
+    }
+}
+
 impl PassStore {
-    /// The store at `loc`, with `~/` expanded (in configured values and in
-    /// `$PASSWORD_STORE_DIR` / `$GNUPGHOME`, which a GUI client's config may
-    /// hold unexpanded) and the root and homedir made absolute (so the paths
-    /// `login` records mean the same thing to a server started from another
-    /// working directory).
+    /// The store at `loc`, falling back to `env` (in production
+    /// [`StoreEnv::from_process`]). `~/` is expanded against `env.home`, in
+    /// configured values and in `$PASSWORD_STORE_DIR` / `$GNUPGHOME` (which a
+    /// GUI client's config may hold unexpanded). The root and homedir are
+    /// made absolute, so the paths `login` records mean the same thing to a
+    /// server started from another working directory. This reads nothing
+    /// from the process environment.
     ///
     /// # Errors
     ///
-    /// When the home directory is needed but unknown, or a path can't be
-    /// made absolute.
-    pub fn resolve(loc: &StoreLocation<'_>, branding: Branding) -> Result<Self, PassError> {
+    /// When the home directory is needed but `env.home` is `None`, or a path
+    /// can't be made absolute.
+    pub fn resolve(
+        loc: &StoreLocation<'_>,
+        env: &StoreEnv,
+        branding: Branding,
+    ) -> Result<Self, PassError> {
         let path_err = |e: std::io::Error| PassError::Other(format!("resolving the store: {e}"));
-        let configured = |value: Option<&str>, var: &str| {
-            value
-                .map(str::to_string)
-                .or_else(|| env_var(var))
-                .map(|v| expand_tilde(&v))
-                .transpose()
-                .map_err(path_err)
+        let home = env.home.as_deref();
+        let expand = |v: &str| expand_tilde_in(v, home).map_err(path_err);
+        let configured = |value: Option<&str>, fallback: Option<&str>| {
+            value.or(fallback).map(expand).transpose()
         };
-        let root = match configured(loc.store_dir, "PASSWORD_STORE_DIR")? {
+        let root = match configured(loc.store_dir, env.password_store_dir.as_deref())? {
             Some(dir) => dir,
-            None => home_dir().map_err(path_err)?.join(".password-store"),
+            None => expand("~/.password-store")?,
         };
-        let homedir = configured(loc.gnupg_home, "GNUPGHOME")?;
+        let homedir = configured(loc.gnupg_home, env.gnupg_home.as_deref())?;
         let root = std::path::absolute(&root).map_err(path_err)?;
         let homedir = homedir
             .map(std::path::absolute)
             .transpose()
             .map_err(path_err)?;
-        let gpg = loc
-            .gpg
-            .map_or_else(|| Ok(PathBuf::from("gpg")), expand_tilde)
-            .map_err(path_err)?;
+        let gpg = loc.gpg.map_or_else(|| Ok(PathBuf::from("gpg")), expand)?;
         Ok(Self::new(root, gpg, branding).with_homedir(homedir))
     }
 
@@ -795,8 +834,7 @@ fn spawn_err(gpg: &Path, e: &std::io::Error) -> PassError {
 mod tests {
     use super::*;
     use crate::test_support::{
-        EnvGuard, LOCKED_SNIPPET, NO_SECKEY_SNIPPET, branding, fake_gpg, lock_env, ok_snippet,
-        store,
+        EnvGuard, LOCKED_SNIPPET, NO_SECKEY_SNIPPET, branding, fake_gpg, ok_snippet, store,
     };
 
     fn store_with(name: &str, snippet: &str) -> (tempfile::TempDir, PassEntry) {
@@ -1292,15 +1330,23 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    /// A `StoreEnv` with only a home directory.
+    fn env_with_home(home: &str) -> StoreEnv {
+        StoreEnv {
+            home: Some(home.into()),
+            ..StoreEnv::default()
+        }
+    }
+
     #[test]
     fn relative_store_paths_are_made_absolute() {
-        let _guard = lock_env();
         let store = PassStore::resolve(
             &StoreLocation {
                 gpg: None,
                 store_dir: Some("rel-store"),
                 gnupg_home: Some("rel-gnupg"),
             },
+            &StoreEnv::default(),
             branding(),
         )
         .unwrap();
@@ -1312,56 +1358,58 @@ mod tests {
 
     #[test]
     fn configured_location_beats_environment() {
-        let mut env = EnvGuard::new();
-        env.set("PASSWORD_STORE_DIR", "/env/store")
-            .set("GNUPGHOME", "/env/gnupg");
+        let env = StoreEnv {
+            home: Some("/home/me".into()),
+            password_store_dir: Some("/env/store".into()),
+            gnupg_home: Some("/env/gnupg".into()),
+        };
         let store = PassStore::resolve(
             &StoreLocation {
                 gpg: Some("/opt/gpg/bin/gpg"),
                 store_dir: Some("/stores/pass"),
                 gnupg_home: Some("/keys/gnupg"),
             },
+            &env,
             branding(),
         )
         .unwrap();
         assert_eq!(store.root(), Path::new("/stores/pass"));
         assert_eq!(store.homedir(), Some(Path::new("/keys/gnupg")));
         assert_eq!(store.gpgconf(), PathBuf::from("/opt/gpg/bin/gpgconf"));
-        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
+        let store = PassStore::resolve(&StoreLocation::default(), &env, branding()).unwrap();
         assert_eq!(store.root(), Path::new("/env/store"));
         assert_eq!(store.homedir(), Some(Path::new("/env/gnupg")));
     }
 
     #[test]
-    #[allow(clippy::literal_string_with_formatting_args)]
-    fn placeholder_env_falls_back_to_the_default_store() {
-        let mut env = EnvGuard::new();
-        env.set("PASSWORD_STORE_DIR", "${PASSWORD_STORE_DIR}")
-            .set("GNUPGHOME", "  ");
-        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
-        assert_eq!(
-            store.root(),
-            crate::env::home_dir().unwrap().join(".password-store")
-        );
+    fn an_empty_environment_uses_the_defaults() {
+        let store = PassStore::resolve(
+            &StoreLocation::default(),
+            &env_with_home("/home/me"),
+            branding(),
+        )
+        .unwrap();
+        assert_eq!(store.root(), Path::new("/home/me/.password-store"));
+        // gpg's own lookup decides; nothing is passed as --homedir.
         assert_eq!(store.homedir(), None);
+        assert_eq!(store.gpg(), Path::new("gpg"));
     }
 
     #[test]
     fn tilde_paths_expand_to_home() {
-        let _guard = lock_env();
-        let home = crate::env::home_dir().unwrap();
         let store = PassStore::resolve(
             &StoreLocation {
                 gpg: Some("~/bin/gpg"),
                 store_dir: Some("~/.password-store"),
                 gnupg_home: Some("~/.gnupg"),
             },
+            &env_with_home("/home/me"),
             branding(),
         )
         .unwrap();
-        assert_eq!(store.root(), home.join(".password-store"));
-        assert_eq!(store.homedir(), Some(home.join(".gnupg").as_path()));
-        assert_eq!(store.gpg(), home.join("bin/gpg"));
+        assert_eq!(store.root(), Path::new("/home/me/.password-store"));
+        assert_eq!(store.homedir(), Some(Path::new("/home/me/.gnupg")));
+        assert_eq!(store.gpg(), Path::new("/home/me/bin/gpg"));
     }
 
     #[test]
@@ -1611,11 +1659,8 @@ mod tests {
 
     #[test]
     fn resolve_without_a_home_needs_explicit_paths() {
-        let mut env = EnvGuard::new();
-        for var in ["HOME", "USERPROFILE", "PASSWORD_STORE_DIR", "GNUPGHOME"] {
-            env.remove(var);
-        }
-        let msg = PassStore::resolve(&StoreLocation::default(), branding())
+        let no_home = StoreEnv::default();
+        let msg = PassStore::resolve(&StoreLocation::default(), &no_home, branding())
             .unwrap_err()
             .to_string();
         assert!(msg.contains("home directory"), "{msg}");
@@ -1623,27 +1668,53 @@ mod tests {
             store_dir: Some("~/store"),
             ..StoreLocation::default()
         };
-        assert!(PassStore::resolve(&tilde, branding()).is_err());
+        assert!(PassStore::resolve(&tilde, &no_home, branding()).is_err());
         let explicit = StoreLocation {
             store_dir: Some("/stores/pass"),
             ..StoreLocation::default()
         };
         assert_eq!(
-            PassStore::resolve(&explicit, branding()).unwrap().root(),
+            PassStore::resolve(&explicit, &no_home, branding())
+                .unwrap()
+                .root(),
             Path::new("/stores/pass")
         );
     }
 
     #[test]
     fn environment_paths_expand_tilde() {
-        let mut env = EnvGuard::new();
-        env.set("PASSWORD_STORE_DIR", "~/env-store")
-            .set("GNUPGHOME", "~/env-gnupg");
-        let home = crate::env::home_dir().unwrap();
-        let store = PassStore::resolve(&StoreLocation::default(), branding()).unwrap();
-        assert_eq!(store.root(), home.join("env-store"));
+        let env = StoreEnv {
+            home: Some("/home/me".into()),
+            password_store_dir: Some("~/env-store".into()),
+            gnupg_home: Some("~/env-gnupg".into()),
+        };
+        let store = PassStore::resolve(&StoreLocation::default(), &env, branding()).unwrap();
+        assert_eq!(store.root(), Path::new("/home/me/env-store"));
         // Not `<cwd>/~/env-gnupg`: gpg itself would expand `~/` here.
-        assert_eq!(store.homedir(), Some(home.join("env-gnupg").as_path()));
+        assert_eq!(store.homedir(), Some(Path::new("/home/me/env-gnupg")));
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn from_process_snapshots_the_environment() {
+        let mut env = EnvGuard::new();
+        env.set("HOME", "/home/me")
+            .set("PASSWORD_STORE_DIR", "~/store")
+            .set("GNUPGHOME", "/keys");
+        assert_eq!(
+            StoreEnv::from_process(),
+            StoreEnv {
+                home: Some("/home/me".into()),
+                password_store_dir: Some("~/store".into()),
+                gnupg_home: Some("/keys".into()),
+            }
+        );
+        // Blank and unexpanded placeholders count as unset.
+        env.set("PASSWORD_STORE_DIR", "${PASSWORD_STORE_DIR}")
+            .set("GNUPGHOME", "  ")
+            .remove("HOME")
+            .remove("USERPROFILE");
+        assert_eq!(StoreEnv::from_process(), StoreEnv::default());
     }
 
     #[test]

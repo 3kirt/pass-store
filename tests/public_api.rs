@@ -7,7 +7,7 @@ use std::path::Path;
 
 use http::{HeaderName, StatusCode};
 use pass_store::test_support::{LOCKED_SNIPPET, NO_SECKEY_SNIPPET, fake_gpg, ok_snippet};
-use pass_store::{Branding, LazyToken, PassError, PassStore, StoreLocation, TokenError};
+use pass_store::{Branding, LazyToken, PassError, PassStore, StoreEnv, StoreLocation, TokenError};
 
 fn branding(config: Option<&Path>) -> Branding {
     Branding::new(
@@ -19,12 +19,18 @@ fn branding(config: Option<&Path>) -> Branding {
 fn store(root: &Path, config: Option<&Path>) -> PassStore {
     let root = root.to_str().unwrap();
     let gpg = fake_gpg().to_str().unwrap();
+    // An app's tests build the environment instead of changing the process's.
+    let env = StoreEnv {
+        home: Some("/home/example".into()),
+        ..StoreEnv::default()
+    };
     PassStore::resolve(
         &StoreLocation {
             gpg: Some(gpg),
             store_dir: Some(root),
             gnupg_home: None,
         },
+        &env,
         branding(config),
     )
     .unwrap()
@@ -119,6 +125,14 @@ fn env_helpers_are_public() {
     assert_eq!(
         pass_store::expand_tilde("~/x").unwrap(),
         Path::new("/home/example/x")
+    );
+    assert_eq!(
+        StoreEnv::from_process().home.unwrap(),
+        Path::new("/home/example")
+    );
+    assert_eq!(
+        pass_store::expand_tilde_in("~/y", Some(Path::new("/h"))).unwrap(),
+        Path::new("/h/y")
     );
 }
 

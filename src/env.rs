@@ -9,7 +9,7 @@
 //! treating it as unset falls through to the config file, as an empty value
 //! does.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `v` unless it is blank or an unexpanded `${…}` placeholder.
 #[must_use]
@@ -65,25 +65,38 @@ pub fn home_dir() -> std::io::Result<PathBuf> {
     set("HOME")
         .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cannot determine home directory (HOME is not set)",
-            )
-        })
+        .ok_or_else(no_home)
 }
 
-/// Expand a leading `~/` (config values are often hand-written that way).
+/// Expand a leading `~/` (config values are often hand-written that way)
+/// against [`home_dir`].
 ///
 /// # Errors
 ///
 /// When the path starts with `~` and [`home_dir`] fails.
 pub fn expand_tilde(path: &str) -> std::io::Result<PathBuf> {
+    expand_tilde_in(path, home_dir().ok().as_deref())
+}
+
+/// Expand a leading `~/` against `home` (`None` = unknown).
+///
+/// # Errors
+///
+/// When the path starts with `~` and `home` is `None`.
+pub fn expand_tilde_in(path: &str, home: Option<&Path>) -> std::io::Result<PathBuf> {
+    let home = || home.map(Path::to_path_buf).ok_or_else(no_home);
     match path.strip_prefix("~/") {
-        Some(rest) => Ok(home_dir()?.join(rest)),
-        None if path == "~" => home_dir(),
+        Some(rest) => Ok(home()?.join(rest)),
+        None if path == "~" => home(),
         None => Ok(PathBuf::from(path)),
     }
+}
+
+fn no_home() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot determine home directory (HOME is not set)",
+    )
 }
 
 #[cfg(test)]
@@ -243,5 +256,26 @@ mod tests {
         assert_eq!(read("   "), None);
         assert_eq!(read("set"), Some("set".into()));
         assert_eq!(*warnings.0.lock().unwrap(), vec![VAR.to_string()]);
+    }
+
+    #[test]
+    fn expand_tilde_in_uses_the_given_home_only() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            expand_tilde_in("~/x", Some(home)).unwrap(),
+            PathBuf::from("/home/me/x")
+        );
+        assert_eq!(
+            expand_tilde_in("~", Some(home)).unwrap(),
+            PathBuf::from("/home/me")
+        );
+        assert_eq!(
+            expand_tilde_in("/abs", None).unwrap(),
+            PathBuf::from("/abs")
+        );
+        assert_eq!(
+            expand_tilde_in("~/x", None).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

@@ -29,14 +29,14 @@ pass-store = { version = "0.1", git = "https://github.com/3kirt/pass-store", tag
 ```
 
 ```rust,no_run
-use pass_store::{Branding, PassStore, StoreLocation};
+use pass_store::{Branding, PassStore, StoreEnv, StoreLocation};
 
 # async fn demo(config_dir: Option<&std::path::Path>) -> Result<(), pass_store::PassError> {
 let branding = Branding::new(
     "Proxmox",
     Branding::cli_prefix("proxmox-mcp", "--config-dir", config_dir),
 );
-let store = PassStore::resolve(&StoreLocation::default(), branding)?;
+let store = PassStore::resolve(&StoreLocation::default(), &StoreEnv::from_process(), branding)?;
 let entry = store.entry("proxmox-mcp/pve.example.com")?;
 let token = entry.read_token().await?; // never prompts
 # Ok(()) }
@@ -44,9 +44,15 @@ let token = entry.read_token().await?; // never prompts
 
 `StoreLocation`'s `gpg`, `store_dir` and `gnupg_home` take the app's own
 config values (the apps call them `gpg`, `password_store_dir` and
-`gnupg_home`). Each one left unset falls back to `$PASSWORD_STORE_DIR` /
-`$GNUPGHOME`, then to the defaults (`~/.password-store`, gpg's own
-`~/.gnupg`). A leading `~/` is expanded in all of them.
+`gnupg_home`). Each one left unset falls back to the `StoreEnv`'s
+`password_store_dir` / `gnupg_home`, then to the defaults
+(`~/.password-store`, gpg's own `~/.gnupg`). A leading `~/` is expanded in
+all of them, against `StoreEnv::home`.
+
+`resolve` reads nothing from the process environment: the `StoreEnv` is
+everything it falls back to. In production, take it from the process with
+`StoreEnv::from_process()` (blank and unexpanded `${VAR}` values count as
+unset); in tests, build one.
 
 ### Pinning, deny.toml and local builds
 
@@ -81,19 +87,25 @@ pass-store = { path = "../pass-store" }
 | Feature        | What it adds |
 |----------------|--------------|
 | `http`         | `LazyToken`: an HTTP auth header decrypted on first use (one gpg run for concurrent callers). It is re-read when the server rejects it, so the first request after `login` rotates the token can retry once, and it backs off for 30s when that re-read fails. Depends only on `http = "1"`. |
-| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with a matching fake gpgconf for `status` tests, plus `EnvGuard` (and `lock_env()`) for tests that touch the environment. Make `lock_env()` the app's only environment lock (see below). |
+| `test-support` | `test_support::fake_gpg()`, a fake gpg whose "ciphertext" is a shell snippet emitting canned `[GNUPG:]` status lines (`ok_snippet`, `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`), with a matching fake gpgconf for `status` tests, plus `EnvGuard` and `lock_env()` for the few tests that must touch the process environment (see below). |
 
 ### Testing an app that uses it
 
-pass-store reads `HOME`, `PASSWORD_STORE_DIR` and `GNUPGHOME`, so an app's
-tests that change the environment must exclude pass-store's reads too. A
-separate lock in the app doesn't: make `pass_store::test_support::lock_env()`
-the app's one environment lock (e.g. `pub use
-pass_store::test_support::lock_env;` where your tests expect it), or set
-variables through `EnvGuard`, which holds it. Hold it in any test that
-reaches config loading or `PassStore::resolve()`, even one that only reads.
-The guard can't be held across an `.await`: in an async test that needs it,
-use a sync `#[test]` that takes the lock and `block_on`s its own runtime.
+Tests of store resolution don't need to touch the environment: pass a
+`StoreEnv` built in the test to `PassStore::resolve`. Structure the app's
+config loading the same way (take the `StoreEnv`, and the app's own env
+values, as inputs, and read the process only at startup), and most env
+tests need neither locks nor `set_var`.
+
+Tests that must read or change the real process environment (e.g. of
+`StoreEnv::from_process` or the app's own `env_var` calls) need one shared
+lock. Make `pass_store::test_support::lock_env()` the app's only
+environment lock (e.g. `pub use pass_store::test_support::lock_env;` where
+your tests expect it), since a separate app lock doesn't exclude
+pass-store's own. Set variables through `EnvGuard`, which holds it and
+restores everything on drop. The guard can't be held across an `.await`: in
+an async test that needs it, use a sync `#[test]` that takes the lock and
+`block_on`s its own runtime.
 
 ## Development
 

@@ -38,11 +38,12 @@ mod token;
 struct ReadmeDoctests;
 
 pub use env::{
-    env_var, expand_tilde, home_dir, is_unexpanded_placeholder, is_unset_value, non_blank,
+    env_var, expand_tilde, expand_tilde_in, home_dir, is_unexpanded_placeholder, is_unset_value,
+    non_blank,
 };
 pub use store::{
-    Branding, GPG_TIMEOUT, PassEntry, PassError, PassStore, StoreLocation, create_private_dir,
-    create_private_file, shell_quote,
+    Branding, GPG_TIMEOUT, PassEntry, PassError, PassStore, StoreEnv, StoreLocation,
+    create_private_dir, create_private_file, shell_quote,
 };
 #[cfg(feature = "http")]
 pub use token::{LazyToken, REREAD_BACKOFF, TokenError};

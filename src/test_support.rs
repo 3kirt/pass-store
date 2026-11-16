@@ -154,15 +154,16 @@ exit 2
 ///
 /// Cargo runs tests on several threads of one process, so hold this for the
 /// whole test body around any `set_var` (`HOME`, `PASSWORD_STORE_DIR`,
-/// `GNUPGHOME`, …), and around anything that resolves a store from the
-/// environment.
+/// `GNUPGHOME`, …), and around anything that reads the process
+/// environment: [`crate::StoreEnv::from_process`], [`crate::env_var`],
+/// [`crate::home_dir`] and [`crate::expand_tilde`]. Most tests don't need
+/// it: [`crate::PassStore::resolve`] takes a [`crate::StoreEnv`], so build
+/// one instead.
 ///
 /// **Use this lock as your app's only environment lock.** A second lock of
 /// your own doesn't exclude this one: a test holding it can still change
-/// `HOME` while pass-store reads it (e.g. in [`crate::PassStore::resolve`]
-/// or [`crate::home_dir`]). Re-export it where your tests expect their lock,
-/// e.g. `pub use pass_store::test_support::lock_env;`. Also check for tests
-/// that reach config loading or `resolve()` without holding it at all.
+/// `HOME` while pass-store reads it. Re-export it where your tests expect
+/// their lock, e.g. `pub use pass_store::test_support::lock_env;`.
 ///
 /// The guard is a std mutex guard, so don't hold it across an `.await`
 /// (clippy's `await_holding_lock` rejects that). In a test that needs the
