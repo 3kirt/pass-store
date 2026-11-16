@@ -44,6 +44,46 @@ app's config. Each one left unset falls back to `$PASSWORD_STORE_DIR` /
 `$GNUPGHOME`, then to the defaults (`~/.password-store`, gpg's own
 `~/.gnupg`).
 
+### Using it from git
+
+Until the crate is on crates.io, depend on it from GitHub, pinned to a
+commit or tag:
+
+```toml
+[dependencies]
+pass-store = { version = "0.1", git = "https://github.com/3kirt/pass-store", rev = "<commit>", features = ["http"] }
+
+[dev-dependencies]
+pass-store = { version = "0.1", git = "https://github.com/3kirt/pass-store", rev = "<commit>", features = ["test-support"] }
+```
+
+Keep the `version` next to `git`: without it cargo-deny's
+`wildcards = "deny"` rejects the dependency. `Cargo.lock` records the exact
+commit, so `--locked` builds stay reproducible; `cargo update -p pass-store`
+moves to a new `rev`. In the app's `deny.toml`, allow the git source and the
+crate's license:
+
+```toml
+[sources]
+allow-git = ["https://github.com/3kirt/pass-store"]
+
+[licenses]
+allow = [
+    # ...
+    "GPL-3.0-or-later",
+]
+```
+
+To build against a local checkout without editing Cargo.toml, add an
+uncommitted `.cargo/config.toml` to the app:
+
+```toml
+[patch."https://github.com/3kirt/pass-store"]
+pass-store = { path = "../pass-store" }
+```
+
+Moving to crates.io later only means dropping `git` and `rev`.
+
 ### Cargo features
 
 | Feature        | What it adds |

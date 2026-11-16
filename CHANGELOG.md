@@ -25,3 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `test-support` feature: the shared fake gpg (`fake_gpg`, `ok_snippet`,
   `LOCKED_SNIPPET`, `NO_SECKEY_SNIPPET`, and a `NOPUBKEY` recipient in encrypt
   mode), plus `lock_env`.
+
+### Documentation
+- README: how to depend on the crate from git before it is on crates.io,
+  including the `version` key and the `deny.toml` entries an app needs, and a
+  local-checkout override.
