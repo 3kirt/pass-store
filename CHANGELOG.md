@@ -39,9 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses it, and the non-Unix build is clippy-clean.
 
 ### Documentation
-- README: how to depend on the crate from git before it is on crates.io,
-  including the `version` key and the `deny.toml` entries an app needs, and a
-  local-checkout override.
+- README: how to depend on the crate from git (it is distributed from GitHub
+  only, never crates.io), including the `version` key and the `deny.toml`
+  entries an app needs, and a local-checkout override.
 
 ### Internal
 - About 50 new unit tests: `unlock_interactive`, `agent::state` and
@@ -61,7 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tests run once per feature set.
 - `make test-real-gpg` fails when the real-gpg test skipped or matched
   nothing, instead of reporting `ok`.
-- `/release` now follows gitlab-mcp's: pre-flight checks (clean `main`, the
-  `CARGO_REGISTRY_TOKEN` secret, the version not already published), every
-  local gate, cargo-semver-checks from the second release, and a post-publish
-  build of a throwaway crate against the published version.
+- Releases are `vX.Y.Z` tags with a GitHub release (notes, a source
+  archive, its checksum and a provenance attestation), never crates.io:
+  Cargo.toml sets `publish = false`.
+- `/release` now follows gitlab-mcp's: pre-flight checks (clean `main`,
+  green CI, an unused tag), every local gate, cargo-semver-checks against the
+  previous tag from the second release, and a consumer build against the
+  pushed tag.
+- `make consumer-smoke` (in `make check` and CI) builds a throwaway crate
+  depending on the commit through git, as the apps do. It replaces
+  `make package`.

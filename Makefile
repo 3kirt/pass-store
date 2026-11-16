@@ -15,10 +15,6 @@ WINDOWS_TARGET := x86_64-pc-windows-msvc
 # tests together).
 COVERAGE_MIN := 97
 
-# `cargo package` refuses uncommitted changes; pass PACKAGE_FLAGS=--allow-dirty
-# to check a work tree before committing.
-PACKAGE_FLAGS ?=
-
 # Real tokens for the apps that use this crate: a Proxmox API token secret
 # (USER@REALM!TOKENID=<uuid>), a GitLab PAT, a NetBox v2 token. Test fixtures
 # use obviously fake values.
@@ -34,7 +30,7 @@ define each_feature_set
 endef
 
 .PHONY: build test test-scripts test-real-gpg lint secrets-scan clippy doc lint-workflows \
-	fmt fmt-check deny msrv minimal-versions check-windows coverage package check clean
+	fmt fmt-check deny msrv minimal-versions check-windows coverage consumer-smoke check clean
 
 build:
 	cargo build --locked --all-features
@@ -113,11 +109,12 @@ coverage:
 	REAL_GPG=1 cargo llvm-cov --locked --all-features --fail-under-lines $(COVERAGE_MIN) \
 		-- --include-ignored
 
-# Builds the .crate exactly as crates.io would receive it, and compiles it.
-package:
-	cargo package --locked $(PACKAGE_FLAGS)
+# A throwaway crate depending on this repo's HEAD commit through git, the
+# way the apps do (committed files only).
+consumer-smoke:
+	scripts/consumer-smoke.sh
 
-check: fmt-check lint test deny package
+check: fmt-check lint test deny consumer-smoke
 
 clean:
 	cargo clean

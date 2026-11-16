@@ -1,9 +1,10 @@
-Release pass-store to crates.io by bumping the version, verifying the build, and tagging.
+Release pass-store by bumping the version, verifying the build, and tagging.
 
 This follows the same step list as gitlab-mcp, netbox-mcp and proxmox-mcp,
-adapted for a library: what ships is the `.crate` on crates.io, not release
-binaries, and publishing is permanent (a version can be yanked, never
-replaced). Release from `main`: the release workflow refuses a tag that
+adapted for a library that is distributed only from GitHub: a release is a
+`vX.Y.Z` tag on `main` plus a GitHub release, and the apps depend on the tag
+through git. It is never published to crates.io (`publish = false` in
+Cargo.toml). Release from `main`: the release workflow refuses a tag that
 isn't on it.
 
 ## Steps
@@ -15,17 +16,12 @@ after the tag is pushed.
 
 ```
 git switch main && git pull --ff-only
-git status --porcelain            # must print nothing
-gh secret list | grep CARGO_REGISTRY_TOKEN
+git status --porcelain                  # must print nothing
+gh run list --workflow ci.yml --branch main --limit 1
 ```
 
 - The work tree must be clean and `main` up to date with `origin/main`.
-- `CARGO_REGISTRY_TOKEN` must be a repository secret: `release.yml`'s
-  `cargo publish` needs it. If it's missing, ask the user to add a crates.io
-  API token scoped to publishing `pass-store` (`gh secret set
-  CARGO_REGISTRY_TOKEN`); never ask them to paste the token into the chat.
-- The latest CI run on `main` passed:
-  `gh run list --workflow ci.yml --branch main --limit 1`.
+- The latest CI run on `main` passed.
 
 ### 2. Determine the new version
 
@@ -37,8 +33,16 @@ for changes to public items, and say which bump you picked and why. If the user
 supplied a version as an argument to this command, use that instead. On the
 first release there is no previous tag: release the current `0.1.0`.
 
-Confirm that version isn't on crates.io yet (`cargo info pass-store@<new
-version>` must fail; on the first release, `cargo info pass-store` fails too).
+Confirm the tag doesn't exist yet, locally or on GitHub (both must print
+nothing):
+
+```
+git tag -l v<new version>
+git ls-remote --tags origin v<new version>
+```
+
+A pushed tag is what the apps pin, so it is never moved or reused once
+pushed. A broken release is fixed by a new version.
 
 ### 3. Update Cargo.toml and Cargo.lock
 
@@ -86,7 +90,7 @@ otherwise continue on the pin.
 ### 6. Run the full quality gate — every check must pass
 
 ```
-make check PACKAGE_FLAGS=--allow-dirty
+make check
 make msrv
 make test-real-gpg
 make coverage
@@ -100,8 +104,9 @@ formatting fails, run `make fmt` and re-run.
 - `make check` is the pre-release gate CI also runs: fmt-check, lint
   (secrets scan, clippy over every feature set, fmt, rustdoc, actionlint,
   shellcheck), test (the changelog-script test, then the suite once per
-  feature set), deny, and `cargo package`. `--allow-dirty` is needed only
-  because the version bump isn't committed yet.
+  feature set), deny, and `consumer-smoke`. `consumer-smoke` builds a
+  throwaway crate against the last *commit* through git, so the version
+  bump is checked again in step 9 once it's committed.
 - `make test-real-gpg` drives the local real gpg with throwaway keyrings,
   and fails if the test skipped or didn't run. Confirm the output shows
   `real_gpg_status_codes_classify_as_expected ... ok`; a release whose
@@ -110,20 +115,20 @@ formatting fails, run `make fmt` and re-run.
   cargo-llvm-cov with the `llvm-tools` component, a nightly toolchain, and
   `rustup target add x86_64-pc-windows-msvc`. If one of those isn't
   installed, say so and continue: the release workflow runs all of `ci.yml`
-  before it publishes, so CI still enforces them.
+  before it creates the release, so CI still enforces them.
 
 ### 7. Check the public API change (from the second release on)
 
-Run cargo-semver-checks against the last published version, so the bump from
-step 2 matches what changed:
+Compare the public API with the previous release tag, so the bump from step 2
+matches what changed:
 
 ```
-cargo semver-checks --baseline-version <previous version> --all-features
+cargo semver-checks --baseline-rev v<previous version> --all-features -p pass-store
 ```
 
 If it reports a breaking change and step 2 picked a patch bump, stop and tell
-the user. Skip this step on the first release (there is no baseline). Install
-it with `cargo install --locked cargo-semver-checks` if needed.
+the user. Skip this step on the first release (there is no previous tag).
+Install it with `cargo install --locked cargo-semver-checks` if needed.
 
 ### 8. Update CHANGELOG.md
 
@@ -156,11 +161,11 @@ make test-scripts
 ```
 git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "Bump version to <new version>"
-make package
+make consumer-smoke
 ```
 
-`make package` (now on a clean tree, without `--allow-dirty`) builds the exact
-`.crate` that will be published.
+`make consumer-smoke` now builds against the bump commit itself, exactly as
+an app pinning it would fetch it.
 
 ### 10. Tag the release
 
@@ -171,11 +176,17 @@ git tag -a v<new version> -m v<new version>
 ### 11. Confirm before pushing
 
 Show the user the new version, the commit SHA, and the tag, then ask whether
-to push. Make clear that pushing the tag publishes to crates.io, which can't
-be undone: a version can be yanked but never deleted or replaced. Pushing the
-tag triggers `.github/workflows/release.yml`, which verifies the tag, runs the
-full CI, runs `cargo publish`, and creates the GitHub release with the
-`.crate`, its checksum and a provenance attestation. If they confirm, run:
+to push. Make clear that the apps will pin this tag, so once pushed it is
+permanent: it is never moved or deleted. Pushing the tag triggers
+`.github/workflows/release.yml`. That workflow:
+- verifies the tag (it matches the Cargo.toml version, it is on main, and
+  the CHANGELOG has a section for it),
+- runs the full CI,
+- builds a consumer crate against the tag fetched from GitHub,
+- creates the GitHub release with the CHANGELOG notes and a source archive
+  with its checksum and a provenance attestation.
+
+If they confirm, run:
 
 ```
 git push origin main
@@ -190,31 +201,31 @@ git push origin v<new version>
    gh run watch <run-id> --exit-status
    ```
 
-2. Confirm crates.io serves the new version (the index can lag by a minute):
+2. Confirm the GitHub release exists with the notes and its two assets:
 
    ```
-   cargo info pass-store@<new version>
+   gh release view v<new version> --json assets,body -q '.assets[].name'
    ```
 
-3. Download the release's `.crate` and `checksums.txt` into a fresh scratch
+3. Download the source archive and `checksums.txt` into a fresh scratch
    directory, verify the sha256 (`shasum -a 256 -c checksums.txt`) and the
    provenance:
 
    ```
-   gh attestation verify pass-store-<new version>.crate --repo 3kirt/pass-store
+   gh attestation verify pass-store-<new version>.tar.gz --repo 3kirt/pass-store
    ```
 
-4. Build against the published crate, the way the apps will get it. In a fresh
-   scratch directory, create a throwaway binary crate (`cargo new
-   --vcs none`). Depend on `pass-store = { version = "=<new version>",
-   features = ["http"] }`, with `features = ["test-support"]` as a
-   dev-dependency. Then run `cargo build` and `cargo test`, with one test
-   that writes `ok_snippet("tok")` to an entry and reads it back through
-   `PassStore::new(dir, fake_gpg(), Branding::new("Smoke", "smoke"))`. A
-   failure here is a release regression: report it to the user.
+4. Build against the tag from GitHub, the way the apps will get it:
+
+   ```
+   scripts/consumer-smoke.sh https://github.com/3kirt/pass-store v<new version>
+   ```
+
+   A failure here is a release regression: report it to the user.
 
 5. Report what the apps would change, without editing them: each depends on
-   pass-store through a git `rev`. Moving one to this release means replacing
-   `git`/`rev` with `version = "<new version>"` and dropping the `allow-git`
-   entry from its `deny.toml`. Offer that as a follow-up for the user to
-   run in each app's own session.
+   pass-store through git. Moving one to this release means setting
+   `version = "<major.minor>"` and `tag = "v<new version>"` (in place of any
+   `rev`) on both its pass-store dependency lines, then `cargo update -p
+   pass-store`. Offer that as a follow-up for the user to run in each app's
+   own session.

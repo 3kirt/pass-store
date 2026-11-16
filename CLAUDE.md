@@ -13,7 +13,7 @@ not in an app.
 ## Commands
 
 ```sh
-make check            # pre-release gate: fmt-check lint test deny package
+make check            # pre-release gate: fmt-check lint test deny consumer-smoke
 make build            # cargo build --all-features
 make test             # scripts/test-changelog.sh, then cargo test once per feature set
 make lint             # secrets-scan, clippy (each feature set), fmt --check, rustdoc -D warnings, actionlint + shellcheck
@@ -23,7 +23,7 @@ make msrv             # cargo +<rust-version> test --all-features
 make minimal-versions # direct deps at Cargo.toml's lower bounds (nightly resolve), suite on the MSRV
 make check-windows    # clippy for x86_64-pc-windows-msvc: the cfg(not(unix)) paths
 make coverage         # cargo llvm-cov incl. real gpg; fails under COVERAGE_MIN (97%) lines
-make package          # cargo package (PACKAGE_FLAGS=--allow-dirty before committing)
+make consumer-smoke   # a throwaway crate depending on HEAD through git, as the apps do
 make test-real-gpg    # REAL_GPG=1: the real-gpg test (throwaway keys); fails if it skipped or didn't run
 
 cargo test <test_name>   # run a single test
@@ -34,25 +34,29 @@ clean before every commit: `make fmt`, then `make lint`.
 
 **CI/CD** (the same shape as the three apps): the Makefile is the single source of
 truth, and the workflows only call its targets.
-- `ci.yml` runs lint, test and real-gpg on ubuntu and macos, deny, package,
-  the non-Unix build, coverage and minimal-versions, plus msrv except on
-  PRs. `release.yml` calls it as a gate.
+- `ci.yml` runs lint, test and real-gpg on ubuntu and macos, deny, the
+  consumer build, the non-Unix build, coverage and minimal-versions, plus
+  msrv except on PRs. `release.yml` calls it as a gate.
+- **Distribution:** GitHub only, never crates.io (`publish = false`). A
+  release is a `vX.Y.Z` tag on main plus a GitHub release, and the apps pin
+  the tag through git. A pushed tag is never moved or reused.
 - `release.yml` runs on a `v*` tag. It runs verify (tag == Cargo.toml version,
-  the tag is on main, the CHANGELOG has a section), then CI, then
-  `cargo publish` (secret `CARGO_REGISTRY_TOKEN`), then a GitHub release with
-  the `.crate`, a checksum, a provenance attestation and notes from
-  `scripts/changelog-section.sh`. Release with `/release`
+  the tag is on main, the CHANGELOG has a section), then CI, then a consumer
+  build against the tag fetched from GitHub, then a GitHub release with
+  notes from `scripts/changelog-section.sh` and a source archive with its
+  checksum and provenance attestation. Release with `/release`
   (`.claude/commands/release.md`). It runs pre-flight checks (clean `main`,
-  the secret, a version not already on crates.io), the full local gate,
-  cargo-semver-checks from the second release on, and, after publishing, a
-  build of a throwaway crate against the published version.
+  green CI, an unused tag), the full local gate, cargo-semver-checks against
+  the previous tag from the second release on, and a consumer build against
+  the pushed tag.
 - `scheduled.yml` runs weekly: deny, msrv, stable/beta drift and real gpg on
   ubuntu and macos. A failure opens a `scheduled-failure` issue.
 - Actions are pinned by commit SHA, with a `# vX.Y.Z` comment.
 
 The toolchain is pinned in `rust-toolchain.toml` (1.100.0). The MSRV is
 `rust-version` in Cargo.toml (1.88, the lowest of the three apps); keep it
-buildable. cargo-deny bans aws-lc-sys/aws-lc-rs, allows crates.io sources only,
+buildable. cargo-deny bans aws-lc-sys/aws-lc-rs, allows crates.io sources only
+(for this crate's own dependencies),
 and lists only licenses actually in the tree. A new license must be
 GPL-3.0-compatible before it goes into `deny.toml`. The crate is
 GPL-3.0-or-later, which fits proxmox and gitlab (GPL-3.0-only) and netbox
@@ -98,7 +102,7 @@ src/
   test_support.rs — (test or feature test-support) fake gpg, snippets, lock_env
   real_gpg.rs     — (#[ignore], REAL_GPG=1) the real-gpg classification test
 tests/public_api.rs — the public API as an app uses it
-scripts/        — changelog-section.sh (release notes) and its test
+scripts/        — changelog-section.sh (release notes) and its test, consumer-smoke.sh
 ```
 
 ## Branding

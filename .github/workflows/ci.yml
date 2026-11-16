@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  # Lets release.yml run these exact checks as a gate before publishing.
+  # Lets release.yml run these exact checks as a gate before releasing.
   workflow_call:
 
 permissions:
@@ -122,15 +122,20 @@ jobs:
           tool: cargo-deny
       - run: make deny
 
-  package:
-    name: Package
+  consumer:
+    name: Consumer build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Cargo fetches the commit from this clone; a shallow one may lack
+          # what a git fetch needs.
+          fetch-depth: 0
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # The .crate as crates.io would receive it, built on its own.
-      - run: make package
+      # A throwaway crate depending on this commit through git, as the apps
+      # do: catches anything that only works from the work tree.
+      - run: make consumer-smoke
 
   msrv:
     name: MSRV

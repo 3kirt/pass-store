@@ -10,7 +10,8 @@ repository = "https://github.com/3kirt/pass-store"
 readme = "README.md"
 keywords = ["pass", "gpg", "gnupg", "password-store", "mcp"]
 categories = ["authentication", "cryptography"]
-include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+# Distributed from GitHub only (apps pin a release tag); never crates.io.
+publish = false
 
 [features]
 # The shared fake gpg for the apps' own tests (client, launch_path).
